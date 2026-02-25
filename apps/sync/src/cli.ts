@@ -1855,7 +1855,15 @@ async function runSync(command: SyncCommand, resetContext: boolean = false) {
           await materializeRegistrationServicesForChain(endpoint.chainId, {});
           break;
         case 'trust-ledger': {
-          await syncTrustLedgerToGraphdbForChain(endpoint.chainId, { resetContext });
+          const agentIdsArg = process.argv.find((a) => a.startsWith('--agent-ids='));
+          const agentIds = agentIdsArg
+            ? String(agentIdsArg.split('=')[1] ?? '')
+                .trim()
+                .split(',')
+                .map((s) => s.trim())
+                .filter((s) => /^\d+$/.test(s))
+            : undefined;
+          await syncTrustLedgerToGraphdbForChain(endpoint.chainId, { resetContext, agentIds });
           break;
         }
         case 'ens-parent': {

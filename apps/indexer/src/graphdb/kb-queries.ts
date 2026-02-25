@@ -309,8 +309,6 @@ async function hydrateIdentitiesForAgents(args: {
     '  ?nftMetadataJson',
     '  ?registeredBy',
     '  ?registryNamespace',
-    '  ?skillOut',
-    '  ?domainOut',
     '  ?ownerAccount',
     '  ?ownerAccountChainId',
     '  ?ownerAccountAddress',
@@ -347,17 +345,8 @@ async function hydrateIdentitiesForAgents(args: {
     '        OPTIONAL { ?desc erc8004:nftMetadataJson ?nftMetadataJson . }',
     '        OPTIONAL { ?desc erc8004:registeredBy ?registeredBy . }',
     '        OPTIONAL { ?desc erc8004:registryNamespace ?registryNamespace . }',
-    '        OPTIONAL {',
-    '          ?desc oasf:hasSkill ?_skill .',
-    '          OPTIONAL { ?_skill core:hasSkillClassification ?_skillClass . OPTIONAL { ?_skillClass oasf:key ?_skillKey . } }',
-    '          OPTIONAL { ?_skill core:skillId ?_skillId . }',
-    '          BIND(COALESCE(?_skillKey, ?_skillId, STR(?_skill)) AS ?skillOut)',
-    '        }',
-    '        OPTIONAL {',
-    '          ?desc oasf:hasDomain ?_domain .',
-    '          OPTIONAL { ?_domain core:hasDomainClassification ?_domainClass . OPTIONAL { ?_domainClass oasf:key ?_domainKey . } }',
-    '          BIND(COALESCE(?_domainKey, STR(?_domain)) AS ?domainOut)',
-    '        }',
+    // NOTE: Skills/domains are hydrated separately to avoid SPARQL cartesian blowups
+    // that can cause some identities to be dropped from the result set in GraphDB.
     '      }',
     '',
     '      OPTIONAL {',
@@ -414,30 +403,10 @@ async function hydrateIdentitiesForAgents(args: {
     '      BIND(?did AS ?didEns)',
     '    }',
     '',
-    '    OPTIONAL {',
-    '      FILTER(BOUND(?ownerAccount))',
-    '      OPTIONAL { ?ownerAccount eth:accountChainId ?ownerAccountChainId . }',
-    '      OPTIONAL { ?ownerAccount eth:accountAddress ?ownerAccountAddress . }',
-    '      OPTIONAL {',
-    '        OPTIONAL { ?ownerAccount eth:accountType ?_oaT . }',
-    '        OPTIONAL { ?ownerAccount a eth:EOAAccount . BIND("EOAAccount" AS ?_oaType2) }',
-    '        OPTIONAL { ?ownerAccount a eth:SmartAccount . BIND("SmartAccount" AS ?_oaType2) }',
-    '        BIND(COALESCE(?_oaT, ?_oaType2, "Account") AS ?ownerAccountType)',
-    '      }',
-    '      OPTIONAL { ?ownerAccount core:hasIdentifier ?_oaIdent . ?_oaIdent core:protocolIdentifier ?ownerAccountDidEthr . }',
-    '    }',
-    '    OPTIONAL {',
-    '      FILTER(BOUND(?agentAccount))',
-    '      OPTIONAL { ?agentAccount eth:accountChainId ?agentAccountChainId . }',
-    '      OPTIONAL { ?agentAccount eth:accountAddress ?agentAccountAddress . }',
-    '      OPTIONAL {',
-    '        OPTIONAL { ?agentAccount eth:accountType ?_aaT . }',
-    '        OPTIONAL { ?agentAccount a eth:EOAAccount . BIND("EOAAccount" AS ?_aaType2) }',
-    '        OPTIONAL { ?agentAccount a eth:SmartAccount . BIND("SmartAccount" AS ?_aaType2) }',
-    '        BIND(COALESCE(?_aaT, ?_aaType2, "Account") AS ?agentAccountType)',
-    '      }',
-    '      OPTIONAL { ?agentAccount core:hasIdentifier ?_aaIdent . ?_aaIdent core:protocolIdentifier ?agentAccountDidEthr . }',
-    '    }',
+    // NOTE: Account hydration is intentionally omitted here.
+    // The prior pattern `OPTIONAL { FILTER(BOUND(?ownerAccount)) ... }` can cause GraphDB
+    // to drop identity rows when the account vars are unbound (optimizer/planner behavior).
+    // If account details are needed, hydrate them in a separate query keyed by the bound IRIs.
     `  }`,
     '}',
     '',
@@ -602,8 +571,6 @@ async function hydrateIdentitiesForPairs(args: {
     '  ?nftMetadataJson',
     '  ?registeredBy',
     '  ?registryNamespace',
-    '  ?skillOut',
-    '  ?domainOut',
     '  ?ownerAccount',
     '  ?ownerAccountChainId',
     '  ?ownerAccountAddress',
@@ -640,17 +607,8 @@ async function hydrateIdentitiesForPairs(args: {
     '      OPTIONAL { ?desc erc8004:nftMetadataJson ?nftMetadataJson . }',
     '      OPTIONAL { ?desc erc8004:registeredBy ?registeredBy . }',
     '      OPTIONAL { ?desc erc8004:registryNamespace ?registryNamespace . }',
-    '      OPTIONAL {',
-    '        ?desc oasf:hasSkill ?_skill .',
-    '        OPTIONAL { ?_skill core:hasSkillClassification ?_skillClass . OPTIONAL { ?_skillClass oasf:key ?_skillKey . } }',
-    '        OPTIONAL { ?_skill core:skillId ?_skillId . }',
-    '        BIND(COALESCE(?_skillKey, ?_skillId, STR(?_skill)) AS ?skillOut)',
-    '      }',
-    '      OPTIONAL {',
-    '        ?desc oasf:hasDomain ?_domain .',
-    '        OPTIONAL { ?_domain core:hasDomainClassification ?_domainClass . OPTIONAL { ?_domainClass oasf:key ?_domainKey . } }',
-    '        BIND(COALESCE(?_domainKey, STR(?_domain)) AS ?domainOut)',
-    '      }',
+    // NOTE: Skills/domains are hydrated separately to avoid SPARQL cartesian blowups
+    // that can cause some identities to be dropped from the result set in GraphDB.
     '    }',
     '',
     '    OPTIONAL {',
@@ -708,30 +666,10 @@ async function hydrateIdentitiesForPairs(args: {
     '      BIND(?did AS ?didEns)',
     '    }',
     '',
-    '    OPTIONAL {',
-    '      FILTER(BOUND(?ownerAccount))',
-    '      OPTIONAL { ?ownerAccount eth:accountChainId ?ownerAccountChainId . }',
-    '      OPTIONAL { ?ownerAccount eth:accountAddress ?ownerAccountAddress . }',
-    '      OPTIONAL {',
-    '        OPTIONAL { ?ownerAccount eth:accountType ?_oaT . }',
-    '        OPTIONAL { ?ownerAccount a eth:EOAAccount . BIND("EOAAccount" AS ?_oaType2) }',
-    '        OPTIONAL { ?ownerAccount a eth:SmartAccount . BIND("SmartAccount" AS ?_oaType2) }',
-    '        BIND(COALESCE(?_oaT, ?_oaType2, "Account") AS ?ownerAccountType)',
-    '      }',
-    '      OPTIONAL { ?ownerAccount core:hasIdentifier ?_oaIdent . ?_oaIdent core:protocolIdentifier ?ownerAccountDidEthr . }',
-    '    }',
-    '    OPTIONAL {',
-    '      FILTER(BOUND(?agentAccount))',
-    '      OPTIONAL { ?agentAccount eth:accountChainId ?agentAccountChainId . }',
-    '      OPTIONAL { ?agentAccount eth:accountAddress ?agentAccountAddress . }',
-    '      OPTIONAL {',
-    '        OPTIONAL { ?agentAccount eth:accountType ?_aaT . }',
-    '        OPTIONAL { ?agentAccount a eth:EOAAccount . BIND("EOAAccount" AS ?_aaType2) }',
-    '        OPTIONAL { ?agentAccount a eth:SmartAccount . BIND("SmartAccount" AS ?_aaType2) }',
-    '        BIND(COALESCE(?_aaT, ?_aaType2, "Account") AS ?agentAccountType)',
-    '      }',
-    '      OPTIONAL { ?agentAccount core:hasIdentifier ?_aaIdent . ?_aaIdent core:protocolIdentifier ?agentAccountDidEthr . }',
-    '    }',
+    // NOTE: Account hydration is intentionally omitted here.
+    // The prior pattern `OPTIONAL { FILTER(BOUND(?ownerAccount)) ... }` can cause GraphDB
+    // to drop identity rows when the account vars are unbound (optimizer/planner behavior).
+    // If account details are needed, hydrate them in a separate query keyed by the bound IRIs.
     '  }',
     '}',
     '',
@@ -1083,6 +1021,8 @@ function pickAgentTypesFromRow(typeValues: string[]): string[] {
 
 // Chunk size for trust-ledger badge hydrate. GraphDB/HTTP truncate result sets; use 3 agents (~21 bindings) per chunk.
 const TRUST_LEDGER_BADGE_HYDRATE_CHUNK = 3;
+// Page size for badge-award hydration (avoid GraphDB/HTTP result truncation on agents with many awards).
+const TRUST_LEDGER_BADGE_HYDRATE_PAGE_LIMIT = 250;
 
 function normalizeAgentIriForBadgeMap(iri: string | null): string {
   const s = typeof iri === 'string' ? iri.trim() : '';
@@ -1106,41 +1046,58 @@ async function hydrateTrustLedgerBadgesForAgents(args: {
     const chunk = agentIris.slice(i, i + chunkSize);
     const valuesAgents = chunk.map((a) => `<${a}>`).join(' ');
     const systemCtx = 'https://www.agentictrust.io/graph/data/analytics/system';
-    // Single pattern (no UNION) to avoid doubling bindings and hitting result truncation limits.
-    const sparql = [
-      'PREFIX analytics: <https://agentictrust.io/ontology/core/analytics#>',
-      'PREFIX prov: <http://www.w3.org/ns/prov#>',
-      '',
-      'SELECT',
-      '  ?agent ?award ?awardedAt ?evidenceJson',
-      // NOTE: Only select the minimal definition fields needed by the GraphQL clients today.
-      // The system graph may accumulate multiple values for fields like createdAt/updatedAt across sync runs,
-      // which can cause result fanout and trigger GraphDB result-size limits (returning partial badge lists).
-      '  ?badgeId ?name ?iconRef ?points',
-      'WHERE {',
-      `  VALUES ?agent { ${valuesAgents} }`,
-      `  GRAPH <${analyticsCtxIri}> {`,
-      '    ?agent analytics:hasTrustLedgerBadgeAward ?award .',
-      '    ?award a analytics:TrustLedgerBadgeAward, prov:Entity .',
-      '    OPTIONAL { ?award analytics:awardedAt ?awardedAt }',
-      '    OPTIONAL { ?award analytics:evidenceJson ?evidenceJson }',
-      '    OPTIONAL { ?award analytics:awardedBadgeDefinition ?def }',
-      '  }',
-      '  OPTIONAL {',
-      `    GRAPH <${systemCtx}> {`,
-      '      FILTER(BOUND(?def))',
+
+    const pageLimit = Math.max(10, TRUST_LEDGER_BADGE_HYDRATE_PAGE_LIMIT);
+    let offset = 0;
+    const bindings: any[] = [];
+
+    for (;;) {
+      // Single pattern (no UNION) to avoid doubling bindings and hitting result truncation limits.
+      // Page with LIMIT/OFFSET to avoid GraphDB/HTTP truncating large result sets for "badge-heavy" agents.
+      const sparql = [
+        'PREFIX analytics: <https://agentictrust.io/ontology/core/analytics#>',
+        'PREFIX prov: <http://www.w3.org/ns/prov#>',
+        '',
+        'SELECT',
+        '  ?agent ?award ?awardedAt ?evidenceJson',
+        // NOTE: Only select the minimal definition fields needed by the GraphQL clients today.
+        // The system graph may accumulate multiple values for fields like createdAt/updatedAt across sync runs,
+        // which can cause result fanout and trigger GraphDB result-size limits (returning partial badge lists).
+        '  ?badgeId ?name ?iconRef ?points',
+        'WHERE {',
+        `  VALUES ?agent { ${valuesAgents} }`,
+        `  GRAPH <${analyticsCtxIri}> {`,
+        '    ?agent analytics:hasTrustLedgerBadgeAward ?award .',
+        '    ?award a analytics:TrustLedgerBadgeAward, prov:Entity .',
+        '    OPTIONAL { ?award analytics:awardedAt ?awardedAt }',
+        '    OPTIONAL { ?award analytics:evidenceJson ?evidenceJson }',
+        '    OPTIONAL { ?award analytics:awardedBadgeDefinition ?def }',
+        '  }',
+        '  OPTIONAL {',
+        `    GRAPH <${systemCtx}> {`,
+        '      FILTER(BOUND(?def))',
         '      ?def analytics:badgeId ?badgeId ;',
         '           analytics:name ?name ;',
         '           analytics:points ?points .',
         '      OPTIONAL { ?def analytics:iconRef ?iconRef }',
-      '    }',
-      '  }',
-      '}',
-      'ORDER BY ?agent ?award',
-      '',
-    ].join('\n');
+        '    }',
+        '  }',
+        '}',
+        'ORDER BY ?agent ?award',
+        `LIMIT ${pageLimit}`,
+        `OFFSET ${offset}`,
+        '',
+      ].join('\n');
 
-    const bindings = await runGraphdbQuery(sparql, args.graphdbCtx, 'kbAgentsQuery.trustLedgerBadges');
+      const page = await runGraphdbQuery(sparql, args.graphdbCtx, 'kbAgentsQuery.trustLedgerBadges');
+      if (!page.length) break;
+      bindings.push(...page);
+      if (page.length < pageLimit) break;
+      offset += page.length;
+      // Safety: avoid infinite loops if GraphDB ignores OFFSET for some reason.
+      if (offset > 50_000) break;
+    }
+
     const byAgentAward = new Map<string, Map<string, HydratedTrustLedgerBadgeAward>>();
 
     const ensure = (agent: string, awardIri: string): HydratedTrustLedgerBadgeAward => {

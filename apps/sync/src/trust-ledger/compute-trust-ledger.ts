@@ -203,19 +203,23 @@ function badgeDefsTurtle(defs: TrustLedgerBadgeDefinition[], now: number): strin
 
 function signalsPageSparql(args: { chainId: number; ctx: string; limit: number; offset: number }): string {
   const { ctx, limit, offset } = args;
-  // ERC-8004 only: derive numeric agent id from the ERC-8004 identity (not from the agent node).
+  // IMPORTANT: derive agentId from the agent IRI (not from core:hasIdentity joins).
+  // We have observed cases where an ERC-8004 identity node (agentId) is linked to multiple agents,
+  // which would cross-contaminate this trust-ledger computation because it mints deterministic IRIs
+  // by (chainId, agentId).
+  const agentPrefix = `https://www.agentictrust.io/id/agent/${Math.trunc(args.chainId)}/`;
   return [
     'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>',
     'PREFIX core: <https://agentictrust.io/ontology/core#>',
-    'PREFIX erc8004: <https://agentictrust.io/ontology/erc8004#>',
-    'PREFIX erc8092: <https://agentictrust.io/ontology/erc8092#>',
     '',
     'SELECT ?agent ?agentId ?validationCount ?feedbackCount WHERE {',
     '  {',
     '    SELECT ?agent ?agentId WHERE {',
     `      GRAPH <${ctx}> {`,
-    '        ?agent a core:AIAgent ; core:hasIdentity ?id .',
-    '        ?id a erc8004:AgentIdentity8004 ; erc8004:agentId ?agentId .',
+          '        ?agent a core:AIAgent .',
+          `        FILTER(STRSTARTS(STR(?agent), "${agentPrefix}"))`,
+          `        BIND(STRAFTER(STR(?agent), "${agentPrefix}") AS ?agentId)`,
+          '        FILTER(REGEX(?agentId, "^[0-9]+$"))',
     '      }',
     '    }',
     '    ORDER BY xsd:integer(?agentId) ASC(STR(?agent))',
@@ -232,20 +236,22 @@ function signalsPageSparql(args: { chainId: number; ctx: string; limit: number; 
   ].join('\n');
 }
 
-function signalsForAgentIdsSparql(args: { ctx: string; agentIds: number[] }): string {
+function signalsForAgentIdsSparql(args: { ctx: string; chainId: number; agentIds: number[] }): string {
   const { ctx } = args;
   const ids = Array.from(new Set((args.agentIds || []).map((n) => Math.trunc(Number(n))).filter((n) => Number.isFinite(n) && n >= 0)));
   if (!ids.length) return 'SELECT ?agent WHERE { FILTER(false) }';
+  const chainId = Number.isFinite(Number(args.chainId)) ? Math.trunc(Number(args.chainId)) : 0;
+  const agentPrefix = `https://www.agentictrust.io/id/agent/${chainId}/`;
+  const agentIris = ids.map((n) => `<${agentPrefix}${n}>`).join(' ');
   return [
     'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>',
     'PREFIX core: <https://agentictrust.io/ontology/core#>',
-    'PREFIX erc8004: <https://agentictrust.io/ontology/erc8004#>',
     '',
     'SELECT ?agent ?agentId ?validationCount ?feedbackCount WHERE {',
     `  GRAPH <${ctx}> {`,
-    `    VALUES ?agentId { ${ids.map((n) => String(n)).join(' ')} }`,
-    '    ?agent a core:AIAgent ; core:hasIdentity ?id .',
-    '    ?id a erc8004:AgentIdentity8004 ; erc8004:agentId ?agentId .',
+    `    VALUES ?agent { ${agentIris} }`,
+    '    ?agent a core:AIAgent .',
+    `    BIND(STRAFTER(STR(?agent), "${agentPrefix}") AS ?agentId)`,
     '    OPTIONAL { ?agent core:hasValidationAssertionSummary ?vs . ?vs core:validationAssertionCount ?validationCount . }',
     '    OPTIONAL { ?agent core:hasFeedbackAssertionSummary ?fs . ?fs core:feedbackAssertionCount ?feedbackCount . }',
     '  }',
@@ -578,44 +584,61 @@ export async function computeTrustLedgerAwardsToGraphdbForChain(
   for (let offset = 0; processedAgents < maxAgents; offset += pageSize) {
     const sparql =
       targetAgentIds && targetAgentIds.length
-        ? signalsForAgentIdsSparql({ ctx, agentIds: targetAgentIds })
+        ? signalsForAgentIdsSparql({ ctx, chainId: cId, agentIds: targetAgentIds })
         : signalsPageSparql({ chainId: cId, ctx, limit: pageSize, offset });
     const res = await queryGraphdb(baseUrl, repository, auth, sparql);
     const bindings: any[] = Array.isArray(res?.results?.bindings) ? res.results.bindings : [];
     if (!bindings.length) break;
 
     const agentIris = bindings.map((b) => asStrBinding(b?.agent)).filter((x): x is string => Boolean(x));
-    if (targetAgentIds && targetAgentIds.length && agentIris.length) {
-      // Clear existing awards+score for these agents to avoid duplicate awards on re-runs.
+    if (!opts?.resetContext && agentIris.length) {
+      // Clear existing awards+score for these agents so this computation is idempotent.
+      // Without this, old awards can linger when rules change, and score nodes can accumulate
+      // multiple badgeCount/totalPoints values (queries using SAMPLE() may pick stale/high values).
       const values = agentIris.map((a) => `<${a}>`).join(' ');
       const del = `
 PREFIX analytics: <https://agentictrust.io/ontology/core/analytics#>
 WITH <${outCtx}>
-DELETE { ?agent analytics:hasTrustLedgerBadgeAward ?award . ?award ?p ?o . }
+DELETE { ?any analytics:hasTrustLedgerBadgeAward ?award . ?award ?p ?o . }
 WHERE {
   VALUES ?agent { ${values} }
-  ?agent analytics:hasTrustLedgerBadgeAward ?award .
+  { ?agent analytics:hasTrustLedgerBadgeAward ?award . } UNION { ?award analytics:badgeAwardForAgent ?agent . }
+  OPTIONAL { ?any analytics:hasTrustLedgerBadgeAward ?award . }
   ?award ?p ?o .
 };
 WITH <${outCtx}>
-DELETE { ?agent analytics:hasTrustLedgerScore ?score . ?score ?sp ?so . }
+DELETE { ?any analytics:hasTrustLedgerScore ?score . ?score ?sp ?so . }
 WHERE {
   VALUES ?agent { ${values} }
-  ?agent analytics:hasTrustLedgerScore ?score .
+  { ?agent analytics:hasTrustLedgerScore ?score . } UNION { ?score analytics:trustLedgerForAgent ?agent . }
+  OPTIONAL { ?any analytics:hasTrustLedgerScore ?score . }
   ?score ?sp ?so .
 }
 `;
       try {
         await updateGraphdb(baseUrl, repository, auth, del, { timeoutMs: 15_000, retries: 0 });
       } catch (e: any) {
-        console.warn('[sync] [trust-ledger] targeted clear failed (non-fatal)', { chainId: cId, err: String(e?.message || e || '') });
+        console.warn('[sync] [trust-ledger] clear existing awards+score failed (non-fatal)', {
+          chainId: cId,
+          err: String(e?.message || e || ''),
+        });
       }
     }
+    const validationCountByAgent = new Map<string, number>();
     const feedbackCountByAgent = new Map<string, number>();
     for (const b of bindings) {
       const a = asStrBinding(b?.agent);
       if (!a) continue;
-      feedbackCountByAgent.set(a, Math.max(0, Math.trunc(asNumBinding(b?.feedbackCount) ?? 0)));
+      {
+        const n = Math.max(0, Math.trunc(asNumBinding(b?.validationCount) ?? 0));
+        const prev = validationCountByAgent.get(a) ?? 0;
+        if (n > prev) validationCountByAgent.set(a, n);
+      }
+      {
+        const n = Math.max(0, Math.trunc(asNumBinding(b?.feedbackCount) ?? 0));
+        const prev = feedbackCountByAgent.get(a) ?? 0;
+        if (n > prev) feedbackCountByAgent.set(a, n);
+      }
     }
 
     const avgScoreByAgent = new Map<string, { n: number; avg: number }>();
@@ -815,18 +838,28 @@ WHERE {
 
     const lines: string[] = [ttlPrefixes()];
 
-    for (const b of bindings) {
-      const agentIri = asStrBinding(b?.agent);
-      const agentId = asStrBinding(b?.agentId);
-      if (!agentIri || !agentId) continue;
+    const uniqueAgents: Array<{ agentIri: string; agentId: string }> = [];
+    {
+      const seen = new Set<string>();
+      for (const b of bindings) {
+        const agentIri = asStrBinding(b?.agent);
+        const agentId = asStrBinding(b?.agentId);
+        if (!agentIri || !agentId) continue;
+        if (seen.has(agentIri)) continue;
+        seen.add(agentIri);
+        uniqueAgents.push({ agentIri, agentId });
+      }
+    }
+
+    for (const { agentIri, agentId } of uniqueAgents) {
 
       const avg = avgScoreByAgent.get(agentIri) ?? { n: 0, avg: 0 };
       const mcpDecl = mcpDeclaredByAgent.get(agentIri) ?? { tools: 0, prompts: 0 };
       const reg = regFlagsByAgent.get(agentIri) ?? { oasfSkills: 0, oasfDomains: 0, x402: false };
 
       const sig: TrustLedgerSignals = {
-        validationCount: Math.max(0, Math.trunc(asNumBinding(b?.validationCount) ?? 0)),
-        feedbackCount: Math.max(0, Math.trunc(asNumBinding(b?.feedbackCount) ?? 0)),
+        validationCount: Math.max(0, Math.trunc(validationCountByAgent.get(agentIri) ?? 0)),
+        feedbackCount: Math.max(0, Math.trunc(feedbackCountByAgent.get(agentIri) ?? 0)),
         feedbackHighRatingCount: Math.max(0, Math.trunc(hiRatingByAgent.get(agentIri) ?? 0)),
         associationApprovedCount: Math.max(0, Math.trunc(assocApprovedByAgent.get(agentIri) ?? 0)),
         feedbackScoreCount: avg.n,
