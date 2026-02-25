@@ -768,6 +768,7 @@ export function emitAgentsTurtle(
       }
     }
 
+    let ensNameFromService: string | null = null;
     {
       // Materialize A2A/MCP endpoints from registration JSON when available.
       // If registration.raw is missing/opaque, fall back to subgraph fields + onchain metadata KV.
@@ -796,6 +797,19 @@ export function emitAgentsTurtle(
         const { skills, domains } = splitSkillsDomains(ep);
         allSkills.push(...skills);
         allDomains.push(...domains);
+
+        // ENS identity from registration "services": { name: "ENS", endpoint: "<name>.eth" }
+        // This is separate from the ENS subgraph `ensName` field; we prefer that when present.
+        if (!ensNameFromService && epName.includes('ens')) {
+          const candidate = serviceUrl.trim();
+          const looksLikeEns =
+            candidate.includes('.') &&
+            candidate.toLowerCase().endsWith('.eth') &&
+            !candidate.includes('://') &&
+            !candidate.includes('/') &&
+            !candidate.includes(' ');
+          if (looksLikeEns) ensNameFromService = candidate.toLowerCase();
+        }
 
         // Only materialize Protocol/ServiceEndpoint triples for known protocol types.
         // Other `services` (e.g. OASF, web, twitter, email) are kept as descriptor evidence only.
@@ -836,10 +850,13 @@ export function emitAgentsTurtle(
     }
 
     // ENS Identity (optional): accept subgraph ensName OR on-chain metadata AGENT NAME if it looks like an ENS name
-    // SKIPPED: registration JSON parsing for ENS name extraction (performance)
+    // Also accept registration JSON services: { name: "ENS", endpoint: "<name>.eth" }
     let ensName = typeof item?.ensName === 'string' ? item.ensName.trim() : '';
     if (!ensName && metaAgentName && metaAgentName.includes('.') && metaAgentName.toLowerCase().endsWith('.eth')) {
       ensName = metaAgentName;
+    }
+    if (!ensName && ensNameFromService) {
+      ensName = ensNameFromService;
     }
     if (ensName) {
       const ensDid = `did:ens:${ensName}`;

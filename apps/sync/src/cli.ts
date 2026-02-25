@@ -328,10 +328,35 @@ async function syncAgents(endpoint: { url: string; chainId: number; name: string
     maxAgentsPerRun,
   });
 
+  // If there are no new agent rows, do not scan agentMetadata_collection or upload prefix-only TTL.
+  // The metadata scan can be very expensive on large subgraphs.
+  if (!items.length) {
+    if (resetContext) {
+      // When resetting, still clear the agents section/context.
+      await ingestSubgraphTurtleToGraphdb({
+        chainId: endpoint.chainId,
+        section: 'agents',
+        turtle: '',
+        resetContext: true,
+      });
+    }
+    console.info('[sync] agents sync complete', {
+      chainId: endpoint.chainId,
+      emitted: false,
+      cursorModeUsed,
+      fetched: 0,
+      note: 'No new agents; skipped metadata scan + ingest.',
+    });
+    return [];
+  }
+
   // Attach on-chain metadata KV rows if the subgraph exposes them (optional).
   // This is required for SmartAgent detection via "AGENT ACCOUNT"/agentAccount metadata.
   // Always-on (best effort): if the subgraph doesn't expose agentMetadata_collection, we just skip quietly.
-  const skipMetadata = false;
+  const skipMetadata =
+    process.env.SYNC_SKIP_AGENT_METADATA === '1' ||
+    process.env.SYNC_SKIP_AGENT_METADATA === 'true' ||
+    process.env.SYNC_SKIP_AGENT_METADATA === 'yes';
   const inferAgentIdFromMetadataId = (id: unknown): string => {
     const s = String(id ?? '').trim();
     if (!s) return '';

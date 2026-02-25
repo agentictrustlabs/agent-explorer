@@ -27,6 +27,16 @@ function sleep(ms: number): Promise<void> {
 
 let lastSubgraphRequestTime = 0;
 
+function hasIndexingError(errors: unknown): boolean {
+  if (!Array.isArray(errors) || errors.length === 0) return false;
+  return errors.some((e: any) => String(e?.message ?? '').trim().toLowerCase() === 'indexing_error');
+}
+
+function hasUsableDataForField(resp: any, field: string): boolean {
+  const v = resp?.data?.[field];
+  return Array.isArray(v);
+}
+
 function getSubgraphRequestDelayMs(): number {
   const v = process.env.SUBGRAPH_REQUEST_DELAY_MS;
   const n = v ? Number(v) : NaN;
@@ -182,7 +192,7 @@ async function fetchQueryFieldNames(graphqlUrl: string): Promise<Set<string>> {
 }
 
 export const AGENTS_QUERY = `query Agents($first: Int!, $skip: Int!) {
-  agents(first: $first, skip: $skip, orderBy: mintedAt, orderDirection: asc) {
+  agents(first: $first, skip: $skip, orderBy: mintedAt, orderDirection: asc, subgraphError: allow) {
     id
     mintedAt
     agentURI
@@ -214,7 +224,7 @@ export const AGENTS_QUERY = `query Agents($first: Int!, $skip: Int!) {
 // Cursor-based pagination to avoid subgraph skip limits (many hosted gateways cap skip to 5000).
 // We paginate by id (monotonic) rather than mintedAt because some subgraphs don't implement mintedAt filters reliably.
 export const AGENTS_QUERY_BY_ID_CURSOR = `query AgentsByIdCursor($first: Int!, $lastId: String!) {
-  agents(first: $first, where: { id_gt: $lastId }, orderBy: id, orderDirection: asc) {
+  agents(first: $first, where: { id_gt: $lastId }, orderBy: id, orderDirection: asc, subgraphError: allow) {
     id
     mintedAt
     agentURI
@@ -251,7 +261,8 @@ export const AGENTS_QUERY_BY_MINTEDAT_CURSOR = `query AgentsByMintedAtCursor($fi
     first: $first,
     where: { or: [ { mintedAt_gt: $lastMintedAt }, { mintedAt: $lastMintedAt, id_gt: $lastId } ] },
     orderBy: mintedAt,
-    orderDirection: asc
+    orderDirection: asc,
+    subgraphError: allow
   ) {
     id
     mintedAt
@@ -282,7 +293,7 @@ export const AGENTS_QUERY_BY_MINTEDAT_CURSOR = `query AgentsByMintedAtCursor($fi
 }`;
 
 export const AGENTS_QUERY_BY_AGENTURI_IN = `query AgentsByAgentUriIn($first: Int!, $uris: [String!]!) {
-  agents(first: $first, where: { agentURI_in: $uris }) {
+  agents(first: $first, where: { agentURI_in: $uris }, subgraphError: allow) {
     id
     agentURI
   }
@@ -295,7 +306,8 @@ export const AGENT_URI_UPDATES_QUERY_BY_BLOCKNUMBER_CURSOR = `query AgentUriUpda
     first: $first,
     where: { or: [ { blockNumber_gt: $lastBlockNumber }, { blockNumber: $lastBlockNumber, id_gt: $lastId } ] },
     orderBy: blockNumber,
-    orderDirection: asc
+    orderDirection: asc,
+    subgraphError: allow
   ) {
     id
     newAgentURI
@@ -312,7 +324,7 @@ export async function fetchAgentMintedAtById(
   const id = String(agentId || '').trim();
   if (!id) return null;
   const query = `query AgentMintedAtById($id: String!) {
-  agents(first: 1, where: { id: $id }) {
+  agents(first: 1, where: { id: $id }, subgraphError: allow) {
     id
     mintedAt
   }
@@ -331,7 +343,7 @@ export async function fetchAgentById(
   const id = String(agentId || '').trim();
   if (!id) return null;
   const query = `query AgentById($id: String!) {
-  agents(first: 1, where: { id: $id }) {
+  agents(first: 1, where: { id: $id }, subgraphError: allow) {
     id
     mintedAt
     agentURI
@@ -469,12 +481,20 @@ export async function fetchAllFromSubgraphByBlockNumberCursor(
     }
 
     if (resp?.errors && Array.isArray(resp.errors) && resp.errors.length > 0) {
-      const errJson = JSON.stringify(resp.errors, null, 2) ?? String(resp.errors);
-      if (optional) {
-        console.warn(`[subgraph] Skipping due to GraphQL errors (optional=true). itemsSoFar=${allItems.length} errors=${errJson}`);
-        return allItems;
+      // Some Graph gateways return `errors: [{message:"indexing_error"}]` even when `subgraphError: allow`
+      // is set and partial entity data is still present. In that case, prefer returning the data we have.
+      if (hasIndexingError(resp.errors) && hasUsableDataForField(resp, field)) {
+        console.warn(`[subgraph] Proceeding despite indexing_error (field=${field}).`);
+        resp.errors = [];
       }
-      throw new Error(`GraphQL query failed: ${errJson}`);
+      if (resp?.errors && Array.isArray(resp.errors) && resp.errors.length > 0) {
+        const errJson = JSON.stringify(resp.errors, null, 2) ?? String(resp.errors);
+        if (optional) {
+          console.warn(`[subgraph] Skipping due to GraphQL errors (optional=true). itemsSoFar=${allItems.length} errors=${errJson}`);
+          return allItems;
+        }
+        throw new Error(`GraphQL query failed: ${errJson}`);
+      }
     }
 
     const batchItems = (((resp?.data?.[field] as any[]) || []) as any[]).filter(Boolean);
@@ -523,7 +543,7 @@ export async function fetchAllFromSubgraphByBlockNumberCursor(
 // NFT on-chain metadata KV rows (AgentMetadata entity)
 // NOTE: some subgraphs expose this as agentMetadata_collection (not agentMetadatas).
 export const AGENT_METADATA_COLLECTION_QUERY = `query AgentMetadataCollection($first: Int!, $skip: Int!) {
-  agentMetadata_collection(first: $first, skip: $skip, orderBy: setAt, orderDirection: asc) {
+  agentMetadata_collection(first: $first, skip: $skip, orderBy: setAt, orderDirection: asc, subgraphError: allow) {
     id
     key
     value
@@ -538,7 +558,7 @@ export const AGENT_METADATA_COLLECTION_QUERY = `query AgentMetadataCollection($f
 
 // Targeted: fetch only metadata rows for one agent id (best-effort; some subgraphs may not support id_starts_with).
 export const AGENT_METADATA_COLLECTION_QUERY_BY_ID_PREFIX = `query AgentMetadataCollectionByIdPrefix($first: Int!, $skip: Int!, $prefix: String!) {
-  agentMetadata_collection(first: $first, skip: $skip, where: { id_starts_with: $prefix }, orderBy: setAt, orderDirection: asc) {
+  agentMetadata_collection(first: $first, skip: $skip, where: { id_starts_with: $prefix }, orderBy: setAt, orderDirection: asc, subgraphError: allow) {
     id
     key
     value
@@ -552,7 +572,7 @@ export const AGENT_METADATA_COLLECTION_QUERY_BY_ID_PREFIX = `query AgentMetadata
 }`;
 
 export const AGENT_METADATA_COLLECTION_QUERY_BY_ID_CURSOR = `query AgentMetadataCollectionByIdCursor($first: Int!, $lastId: String!) {
-  agentMetadata_collection(first: $first, where: { id_gt: $lastId }, orderBy: id, orderDirection: asc) {
+  agentMetadata_collection(first: $first, where: { id_gt: $lastId }, orderBy: id, orderDirection: asc, subgraphError: allow) {
     id
     key
     value
@@ -631,17 +651,23 @@ export async function fetchAllFromSubgraphByIdCursor(
     }
 
     if (resp?.errors && Array.isArray(resp.errors) && resp.errors.length > 0) {
-      const firstErr = resp.errors[0];
-      const firstMsg = firstErr?.message ?? '';
-      if (isCursorUnsupportedErrorMessage(firstMsg)) {
-        throw new Error(`Cursor pagination unsupported for "${field}": ${String(firstMsg || 'unknown error')}`);
+      if (hasIndexingError(resp.errors) && hasUsableDataForField(resp, field)) {
+        console.warn(`[subgraph] Proceeding despite indexing_error (field=${field}).`);
+        resp.errors = [];
       }
-      const errJson = JSON.stringify(resp.errors, null, 2) ?? String(resp.errors);
-      if (optional) {
-        console.warn(`[subgraph] Skipping due to GraphQL errors (optional=true). itemsSoFar=${allItems.length} errors=${errJson}`);
-        return allItems;
+      if (resp?.errors && Array.isArray(resp.errors) && resp.errors.length > 0) {
+        const firstErr = resp.errors[0];
+        const firstMsg = firstErr?.message ?? '';
+        if (isCursorUnsupportedErrorMessage(firstMsg)) {
+          throw new Error(`Cursor pagination unsupported for "${field}": ${String(firstMsg || 'unknown error')}`);
+        }
+        const errJson = JSON.stringify(resp.errors, null, 2) ?? String(resp.errors);
+        if (optional) {
+          console.warn(`[subgraph] Skipping due to GraphQL errors (optional=true). itemsSoFar=${allItems.length} errors=${errJson}`);
+          return allItems;
+        }
+        throw new Error(`GraphQL query failed: ${errJson}`);
       }
-      throw new Error(`GraphQL query failed: ${errJson}`);
     }
 
     const batchItems = (((resp?.data?.[field] as any[]) || []) as any[]).filter(Boolean);
@@ -729,12 +755,18 @@ export async function fetchAllFromSubgraphByMintedAtCursor(
     }
 
     if (resp?.errors && Array.isArray(resp.errors) && resp.errors.length > 0) {
-      const errJson = JSON.stringify(resp.errors, null, 2) ?? String(resp.errors);
-      if (optional) {
-        console.warn(`[subgraph] Skipping due to GraphQL errors (optional=true). itemsSoFar=${allItems.length} errors=${errJson}`);
-        return allItems;
+      if (hasIndexingError(resp.errors) && hasUsableDataForField(resp, field)) {
+        console.warn(`[subgraph] Proceeding despite indexing_error (field=${field}).`);
+        resp.errors = [];
       }
-      throw new Error(`GraphQL query failed: ${errJson}`);
+      if (resp?.errors && Array.isArray(resp.errors) && resp.errors.length > 0) {
+        const errJson = JSON.stringify(resp.errors, null, 2) ?? String(resp.errors);
+        if (optional) {
+          console.warn(`[subgraph] Skipping due to GraphQL errors (optional=true). itemsSoFar=${allItems.length} errors=${errJson}`);
+          return allItems;
+        }
+        throw new Error(`GraphQL query failed: ${errJson}`);
+      }
     }
 
     const batchItems = (((resp?.data?.[field] as any[]) || []) as any[]).filter(Boolean);
@@ -786,7 +818,7 @@ export const FEEDBACKS_QUERY = `query RepFeedbacks($first: Int!, $skip: Int!) {
   #
   # NOTE: Some deployments still throw when selecting agent { id } even with agent_not:null.
   # We intentionally do NOT select the agent relation here, and instead derive agentId from the feedback id.
-  repFeedbacks(first: $first, skip: $skip, orderBy: blockNumber, orderDirection: asc) {
+  repFeedbacks(first: $first, skip: $skip, orderBy: blockNumber, orderDirection: asc, subgraphError: allow) {
     id
     clientAddress
     feedbackIndex
@@ -799,7 +831,7 @@ export const FEEDBACKS_QUERY = `query RepFeedbacks($first: Int!, $skip: Int!) {
 
 /** Optional: fetch feedbacks for one agent (subgraph must support where: { agent: $agentId }). */
 export const FEEDBACKS_QUERY_BY_AGENT = `query RepFeedbacksByAgent($first: Int!, $skip: Int!, $agentId: String!) {
-  repFeedbacks(first: $first, skip: $skip, where: { agent: $agentId }, orderBy: blockNumber, orderDirection: asc) {
+  repFeedbacks(first: $first, skip: $skip, where: { agent: $agentId }, orderBy: blockNumber, orderDirection: asc, subgraphError: allow) {
     id
     clientAddress
     feedbackIndex
@@ -811,7 +843,7 @@ export const FEEDBACKS_QUERY_BY_AGENT = `query RepFeedbacksByAgent($first: Int!,
 }`;
 
 export const FEEDBACK_REVOCATIONS_QUERY = `query RepFeedbackRevokeds($first: Int!, $skip: Int!) {
-  repFeedbackRevokeds(first: $first, skip: $skip, orderBy: blockNumber, orderDirection: asc) {
+  repFeedbackRevokeds(first: $first, skip: $skip, orderBy: blockNumber, orderDirection: asc, subgraphError: allow) {
     id
     clientAddress
     feedbackIndex
@@ -822,7 +854,7 @@ export const FEEDBACK_REVOCATIONS_QUERY = `query RepFeedbackRevokeds($first: Int
 }`;
 
 export const FEEDBACK_RESPONSES_QUERY = `query RepResponseAppendeds($first: Int!, $skip: Int!) {
-  repResponseAppendeds(first: $first, skip: $skip, orderBy: blockNumber, orderDirection: asc) {
+  repResponseAppendeds(first: $first, skip: $skip, orderBy: blockNumber, orderDirection: asc, subgraphError: allow) {
     id
     clientAddress
     feedbackIndex
@@ -837,7 +869,7 @@ export const FEEDBACK_RESPONSES_QUERY = `query RepResponseAppendeds($first: Int!
 }`;
 
 export const VALIDATION_REQUESTS_QUERY = `query ValidationRequests($first: Int!, $skip: Int!) {
-  validationRequests(first: $first, skip: $skip, orderBy: blockNumber, orderDirection: asc) {
+  validationRequests(first: $first, skip: $skip, orderBy: blockNumber, orderDirection: asc, subgraphError: allow) {
     id
     agent { id }
     requestUri
@@ -849,7 +881,7 @@ export const VALIDATION_REQUESTS_QUERY = `query ValidationRequests($first: Int!,
 }`;
 
 export const VALIDATION_REQUESTS_QUERY_BY_AGENT = `query ValidationRequestsByAgent($first: Int!, $skip: Int!, $agentId: String!) {
-  validationRequests(first: $first, skip: $skip, where: { agent: $agentId }, orderBy: blockNumber, orderDirection: asc) {
+  validationRequests(first: $first, skip: $skip, where: { agent: $agentId }, orderBy: blockNumber, orderDirection: asc, subgraphError: allow) {
     id
     agent { id }
     requestUri
@@ -861,7 +893,7 @@ export const VALIDATION_REQUESTS_QUERY_BY_AGENT = `query ValidationRequestsByAge
 }`;
 
 export const VALIDATION_RESPONSES_QUERY = `query ValidationResponses($first: Int!, $skip: Int!) {
-  validationResponses(first: $first, skip: $skip, orderBy: blockNumber, orderDirection: asc) {
+  validationResponses(first: $first, skip: $skip, orderBy: blockNumber, orderDirection: asc, subgraphError: allow) {
     id
     agent { id }
     responseJson
@@ -872,7 +904,7 @@ export const VALIDATION_RESPONSES_QUERY = `query ValidationResponses($first: Int
 }`;
 
 export const VALIDATION_RESPONSES_QUERY_BY_AGENT = `query ValidationResponsesByAgent($first: Int!, $skip: Int!, $agentId: String!) {
-  validationResponses(first: $first, skip: $skip, where: { agent: $agentId }, orderBy: blockNumber, orderDirection: asc) {
+  validationResponses(first: $first, skip: $skip, where: { agent: $agentId }, orderBy: blockNumber, orderDirection: asc, subgraphError: allow) {
     id
     agent { id }
     responseJson
@@ -883,7 +915,7 @@ export const VALIDATION_RESPONSES_QUERY_BY_AGENT = `query ValidationResponsesByA
 }`;
 
 export const ASSOCIATIONS_QUERY = `query Associations($first: Int!, $skip: Int!) {
-  associations(first: $first, skip: $skip, orderBy: lastUpdatedBlockNumber, orderDirection: asc) {
+  associations(first: $first, skip: $skip, orderBy: lastUpdatedBlockNumber, orderDirection: asc, subgraphError: allow) {
     id
     initiatorAccount { id }
     approverAccount { id }
@@ -898,7 +930,7 @@ export const ASSOCIATIONS_QUERY = `query Associations($first: Int!, $skip: Int!)
 }`;
 
 export const ASSOCIATION_REVOCATIONS_QUERY = `query AssociationRevocations($first: Int!, $skip: Int!) {
-  associationRevocations(first: $first, skip: $skip, orderBy: blockNumber, orderDirection: asc) {
+  associationRevocations(first: $first, skip: $skip, orderBy: blockNumber, orderDirection: asc, subgraphError: allow) {
     id
     associationId
     revokedAt
@@ -910,7 +942,7 @@ export const ASSOCIATION_REVOCATIONS_QUERY = `query AssociationRevocations($firs
 
 // ERC-8122 registry agents + metadata (optional: not all subgraphs expose these fields)
 export const REGISTRY_AGENT_8122_QUERY = `query RegistryAgent8122S($first: Int!, $skip: Int!) {
-  registryAgent8122s(first: $first, skip: $skip, orderBy: createdAt, orderDirection: asc) {
+  registryAgent8122s(first: $first, skip: $skip, orderBy: createdAt, orderDirection: asc, subgraphError: allow) {
     agentId
     createdAt
     endpoint
@@ -924,7 +956,7 @@ export const REGISTRY_AGENT_8122_QUERY = `query RegistryAgent8122S($first: Int!,
 }`;
 
 export const REGISTRY_AGENT_8122_QUERY_BY_REGISTRY_IN = `query RegistryAgent8122SByRegistryIn($first: Int!, $skip: Int!, $registries: [Bytes!]!) {
-  registryAgent8122s(first: $first, skip: $skip, where: { registry_in: $registries }, orderBy: createdAt, orderDirection: asc) {
+  registryAgent8122s(first: $first, skip: $skip, where: { registry_in: $registries }, orderBy: createdAt, orderDirection: asc, subgraphError: allow) {
     agentId
     createdAt
     endpoint
@@ -938,7 +970,7 @@ export const REGISTRY_AGENT_8122_QUERY_BY_REGISTRY_IN = `query RegistryAgent8122
 }`;
 
 export const REGISTRY_AGENT_8122_METADATA_COLLECTION_QUERY = `query RegistryAgent8122MetadataCollection($first: Int!, $skip: Int!) {
-  registryAgent8122Metadatas(first: $first, skip: $skip, orderBy: setAt, orderDirection: asc) {
+  registryAgent8122Metadatas(first: $first, skip: $skip, orderBy: setAt, orderDirection: asc, subgraphError: allow) {
     agentId
     blockNumber
     id
@@ -953,7 +985,7 @@ export const REGISTRY_AGENT_8122_METADATA_COLLECTION_QUERY = `query RegistryAgen
 }`;
 
 export const REGISTRY_AGENT_8122_METADATA_COLLECTION_QUERY_BY_REGISTRY_IN = `query RegistryAgent8122MetadataCollectionByRegistryIn($first: Int!, $skip: Int!, $registries: [Bytes!]!) {
-  registryAgent8122Metadatas(first: $first, skip: $skip, where: { registry_in: $registries }, orderBy: setAt, orderDirection: asc) {
+  registryAgent8122Metadatas(first: $first, skip: $skip, where: { registry_in: $registries }, orderBy: setAt, orderDirection: asc, subgraphError: allow) {
     agentId
     blockNumber
     id
@@ -969,7 +1001,7 @@ export const REGISTRY_AGENT_8122_METADATA_COLLECTION_QUERY_BY_REGISTRY_IN = `que
 
 // Legacy query names (older subgraphs used capitalized root fields and `_collection` suffix)
 export const REGISTRY_AGENT_8122_QUERY_LEGACY = `query RegistryAgent8122S($first: Int!, $skip: Int!) {
-  registryAgent8122S(first: $first, skip: $skip, orderBy: createdAt, orderDirection: asc) {
+  registryAgent8122S(first: $first, skip: $skip, orderBy: createdAt, orderDirection: asc, subgraphError: allow) {
     agentId
     createdAt
     endpoint
@@ -983,7 +1015,7 @@ export const REGISTRY_AGENT_8122_QUERY_LEGACY = `query RegistryAgent8122S($first
 }`;
 
 export const REGISTRY_AGENT_8122_QUERY_BY_REGISTRY_IN_LEGACY = `query RegistryAgent8122SByRegistryIn($first: Int!, $skip: Int!, $registries: [Bytes!]!) {
-  registryAgent8122S(first: $first, skip: $skip, where: { registry_in: $registries }, orderBy: createdAt, orderDirection: asc) {
+  registryAgent8122S(first: $first, skip: $skip, where: { registry_in: $registries }, orderBy: createdAt, orderDirection: asc, subgraphError: allow) {
     agentId
     createdAt
     endpoint
@@ -997,7 +1029,7 @@ export const REGISTRY_AGENT_8122_QUERY_BY_REGISTRY_IN_LEGACY = `query RegistryAg
 }`;
 
 export const REGISTRY_AGENT_8122_METADATA_COLLECTION_QUERY_LEGACY = `query RegistryAgent8122MetadataCollection($first: Int!, $skip: Int!) {
-  registryAgent8122Metadata_collection(first: $first, skip: $skip, orderBy: setAt, orderDirection: asc) {
+  registryAgent8122Metadata_collection(first: $first, skip: $skip, orderBy: setAt, orderDirection: asc, subgraphError: allow) {
     agentId
     blockNumber
     id
@@ -1012,7 +1044,7 @@ export const REGISTRY_AGENT_8122_METADATA_COLLECTION_QUERY_LEGACY = `query Regis
 }`;
 
 export const REGISTRY_AGENT_8122_METADATA_COLLECTION_QUERY_BY_REGISTRY_IN_LEGACY = `query RegistryAgent8122MetadataCollectionByRegistryIn($first: Int!, $skip: Int!, $registries: [Bytes!]!) {
-  registryAgent8122Metadata_collection(first: $first, skip: $skip, where: { registry_in: $registries }, orderBy: setAt, orderDirection: asc) {
+  registryAgent8122Metadata_collection(first: $first, skip: $skip, where: { registry_in: $registries }, orderBy: setAt, orderDirection: asc, subgraphError: allow) {
     agentId
     blockNumber
     id
@@ -1100,62 +1132,68 @@ export async function fetchAllFromSubgraph(
     }
 
     if (resp?.errors && Array.isArray(resp.errors) && resp.errors.length > 0) {
-      const missingField = resp.errors.some((err: any) => {
-        const message = err?.message || '';
-        if (typeof message !== 'string') return false;
-        return message.includes(`field "${field}"`) || message.includes(`field \`${field}\``) || message.includes(field);
-      });
-      const skipLimitError = resp.errors.some((err: any) => {
-        const message = String(err?.message || '').toLowerCase();
-        return message.includes('skip') && message.includes('argument');
-      });
-      const overloadedError = resp.errors.some((err: any) => {
-        const message = String(err?.message || '').toLowerCase();
-        return (
-          message.includes('service is overloaded') ||
-          (message.includes('overloaded') && message.includes('service')) ||
-          message.includes('can not run the query right now') ||
-          message.includes('try again in a few minutes') ||
-          message.includes('rate limit') ||
-          message.includes('too many requests')
-        );
-      });
+      if (hasIndexingError(resp.errors) && hasUsableDataForField(resp, field)) {
+        console.warn(`[subgraph] Proceeding despite indexing_error (field=${field}).`);
+        resp.errors = [];
+      }
+      if (resp?.errors && Array.isArray(resp.errors) && resp.errors.length > 0) {
+        const missingField = resp.errors.some((err: any) => {
+          const message = err?.message || '';
+          if (typeof message !== 'string') return false;
+          return message.includes(`field "${field}"`) || message.includes(`field \`${field}\``) || message.includes(field);
+        });
+        const skipLimitError = resp.errors.some((err: any) => {
+          const message = String(err?.message || '').toLowerCase();
+          return message.includes('skip') && message.includes('argument');
+        });
+        const overloadedError = resp.errors.some((err: any) => {
+          const message = String(err?.message || '').toLowerCase();
+          return (
+            message.includes('service is overloaded') ||
+            (message.includes('overloaded') && message.includes('service')) ||
+            message.includes('can not run the query right now') ||
+            message.includes('try again in a few minutes') ||
+            message.includes('rate limit') ||
+            message.includes('too many requests')
+          );
+        });
 
-      if (optional && missingField) {
-        console.warn(`[subgraph] Skipping: subgraph does not expose field "${field}". Message: ${resp.errors[0]?.message || 'unknown'}`);
-        return [];
-      }
-      if (optional && skipLimitError) {
-        console.warn(`[subgraph] Skipping remaining pages: ${resp.errors[0]?.message || 'skip limit hit'}`);
-        return allItems;
-      }
-      if (overloadedError) {
-        let succeeded = false;
-        const overloadRetries = optional ? maxRetries : 1;
-        for (let attempt = 0; attempt < overloadRetries; attempt++) {
-          const backoffMs = Math.min(60_000, 1_000 * Math.pow(2, attempt)) + Math.floor(Math.random() * 500);
-          console.warn(`[subgraph] Subgraph overloaded; retry ${attempt + 1}/${overloadRetries} after ${backoffMs}ms. Error: ${resp.errors[0]?.message || 'unknown'}`);
-          await sleep(backoffMs);
-          const retryResp = await fetchJson(graphqlUrl, { query, variables }, 1).catch((e: any) => ({ errors: [{ message: String(e?.message || e || '') }] }));
-          if (!retryResp?.errors || retryResp.errors.length === 0) {
-            resp = retryResp;
-            succeeded = true;
-            break;
+        if (optional && missingField) {
+          console.warn(`[subgraph] Skipping: subgraph does not expose field "${field}". Message: ${resp.errors[0]?.message || 'unknown'}`);
+          return [];
+        }
+        if (optional && skipLimitError) {
+          console.warn(`[subgraph] Skipping remaining pages: ${resp.errors[0]?.message || 'skip limit hit'}`);
+          return allItems;
+        }
+        if (overloadedError) {
+          let succeeded = false;
+          const overloadRetries = optional ? maxRetries : 1;
+          for (let attempt = 0; attempt < overloadRetries; attempt++) {
+            const backoffMs = Math.min(60_000, 1_000 * Math.pow(2, attempt)) + Math.floor(Math.random() * 500);
+            console.warn(`[subgraph] Subgraph overloaded; retry ${attempt + 1}/${overloadRetries} after ${backoffMs}ms. Error: ${resp.errors[0]?.message || 'unknown'}`);
+            await sleep(backoffMs);
+            const retryResp = await fetchJson(graphqlUrl, { query, variables }, 1).catch((e: any) => ({ errors: [{ message: String(e?.message || e || '') }] }));
+            if (!retryResp?.errors || retryResp.errors.length === 0) {
+              resp = retryResp;
+              succeeded = true;
+              break;
+            }
+          }
+          if (!succeeded) {
+            console.warn(`[subgraph] Skipping due to overload (optional=${optional}). itemsSoFar=${allItems.length}`);
+            return allItems;
           }
         }
-        if (!succeeded) {
-          console.warn(`[subgraph] Skipping due to overload (optional=${optional}). itemsSoFar=${allItems.length}`);
-          return allItems;
-        }
-      }
 
-      if (resp?.errors && Array.isArray(resp.errors) && resp.errors.length > 0) {
-        const errJson = JSON.stringify(resp.errors, null, 2) ?? String(resp.errors);
-        if (optional) {
-          console.warn(`[subgraph] Skipping due to GraphQL errors (optional=true). itemsSoFar=${allItems.length} errors=${errJson}`);
-          return allItems;
+        if (resp?.errors && Array.isArray(resp.errors) && resp.errors.length > 0) {
+          const errJson = JSON.stringify(resp.errors, null, 2) ?? String(resp.errors);
+          if (optional) {
+            console.warn(`[subgraph] Skipping due to GraphQL errors (optional=true). itemsSoFar=${allItems.length} errors=${errJson}`);
+            return allItems;
+          }
+          throw new Error(`GraphQL query failed: ${errJson}`);
         }
-        throw new Error(`GraphQL query failed: ${errJson}`);
       }
     }
 
