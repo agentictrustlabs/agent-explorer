@@ -390,6 +390,79 @@ export function createGraphQLResolversKb(opts?: GraphQLKbResolverOptions) {
   // IMPORTANT: KB endpoint should only return data materialized in GraphDB.
   // Do not parse identity registration JSON at query-time.
 
+  function collectFieldNamesFromSelections(
+    selections: readonly any[] | undefined,
+    fragments: Record<string, any> | undefined,
+    out: Set<string>,
+  ): void {
+    if (!Array.isArray(selections)) return;
+    for (const sel of selections) {
+      if (!sel) continue;
+      if (sel.kind === 'Field') {
+        const name = sel.name?.value;
+        if (typeof name === 'string' && name) out.add(name);
+      } else if (sel.kind === 'InlineFragment') {
+        collectFieldNamesFromSelections(sel.selectionSet?.selections, fragments, out);
+      } else if (sel.kind === 'FragmentSpread') {
+        const fragName = sel.name?.value;
+        const frag = fragName && fragments ? fragments[fragName] : null;
+        if (frag) collectFieldNamesFromSelections(frag.selectionSet?.selections, fragments, out);
+      }
+    }
+  }
+
+  function selectionHasPath(
+    selections: readonly any[] | undefined,
+    fragments: Record<string, any> | undefined,
+    path: string[],
+  ): boolean {
+    if (!path.length) return true;
+    if (!Array.isArray(selections)) return false;
+    const [head, ...rest] = path;
+    for (const sel of selections) {
+      if (!sel) continue;
+      if (sel.kind === 'Field') {
+        const name = sel.name?.value;
+        if (name !== head) continue;
+        if (!rest.length) return true;
+        if (selectionHasPath(sel.selectionSet?.selections, fragments, rest)) return true;
+      } else if (sel.kind === 'InlineFragment') {
+        if (selectionHasPath(sel.selectionSet?.selections, fragments, path)) return true;
+      } else if (sel.kind === 'FragmentSpread') {
+        const fragName = sel.name?.value;
+        const frag = fragName && fragments ? fragments[fragName] : null;
+        if (frag && selectionHasPath(frag.selectionSet?.selections, fragments, path)) return true;
+      }
+    }
+    return false;
+  }
+
+  function getKbAgentRequestedFields(info: any): Set<string> {
+    // We care about requested fields on the items in `kbAgents { agents { ... } }`
+    const out = new Set<string>();
+    const fieldNodes = Array.isArray(info?.fieldNodes) ? info.fieldNodes : [];
+    const fragments = info?.fragments ?? {};
+    for (const node of fieldNodes) {
+      const selections = node?.selectionSet?.selections;
+      if (!Array.isArray(selections)) continue;
+      for (const sel of selections) {
+        if (sel?.kind !== 'Field') continue;
+        if (sel?.name?.value !== 'agents') continue;
+        collectFieldNamesFromSelections(sel.selectionSet?.selections, fragments, out);
+      }
+    }
+    return out;
+  }
+
+  function infoHasPath(info: any, path: string[]): boolean {
+    const fieldNodes = Array.isArray(info?.fieldNodes) ? info.fieldNodes : [];
+    const fragments = info?.fragments ?? {};
+    for (const node of fieldNodes) {
+      if (selectionHasPath(node?.selectionSet?.selections, fragments, path)) return true;
+    }
+    return false;
+  }
+
   const mapRowToKbAgent = (r: any) => {
     const serviceEndpoints = [
       r.a2aServiceEndpointIri && r.a2aProtocolIri
@@ -1053,7 +1126,7 @@ LIMIT 1
       }));
     },
 
-    kbAgents: async (args: any, ctx: any) => {
+    kbAgents: async (args: any, ctx: any, info: any) => {
       const graphdbCtx = (ctx && typeof ctx === 'object' ? (ctx as any).graphdb : null) as GraphdbQueryContext | null;
       const where = args?.where ?? null;
       if (where && typeof where === 'object') {
@@ -1074,6 +1147,14 @@ LIMIT 1
       const orderBy = args?.orderBy ?? null;
       const orderDirection = args?.orderDirection ?? null;
 
+      const requestedAgentFields = getKbAgentRequestedFields(info);
+      const hydrateIdentities = requestedAgentFields.has('identities');
+      const hydrateServiceEndpoints = requestedAgentFields.has('serviceEndpoints');
+      // Always-on: badge hydration should not depend on selection-set heuristics.
+      // Clients expect badges to be present on list/search results consistently across deployments.
+      const hydrateTrustLedgerBadges = true;
+      const includeTrustLedgerBadgeEvidenceJson = infoHasPath(info, ['agents', 'trustLedgerBadges', 'evidenceJson']);
+
       const { rows, total, hasMore } = await kbAgentsQuery(
         {
           where,
@@ -1083,6 +1164,12 @@ LIMIT 1
           orderDirection,
         },
         graphdbCtx,
+        {
+          hydrateIdentities,
+          hydrateServiceEndpoints,
+          hydrateTrustLedgerBadges,
+          includeTrustLedgerBadgeEvidenceJson,
+        },
       );
 
       const agents = rows.map((r) => mapRowToKbAgent(r));

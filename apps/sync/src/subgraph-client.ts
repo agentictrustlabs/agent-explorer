@@ -585,6 +585,90 @@ export const AGENT_METADATA_COLLECTION_QUERY_BY_ID_CURSOR = `query AgentMetadata
   }
 }`;
 
+/**
+ * Targeted: fetch metadata KV rows for one agentId using cursor paging (no skip).
+ *
+ * Some subgraphs do NOT support `where: { id_starts_with: ... }` for `agentMetadata_collection`.
+ * This function avoids that schema dependency by:
+ * - paging by `id_gt` cursor
+ * - filtering client-side for ids starting with `${agentId}-`
+ * - stopping once the sorted id stream leaves that prefix range
+ */
+export async function fetchAgentMetadataCollectionForAgentId(
+  graphqlUrl: string,
+  agentId: string,
+  opts?: { optional?: boolean; first?: number; maxItems?: number; maxRetries?: number },
+): Promise<any[]> {
+  const id = String(agentId ?? '').trim();
+  if (!id || !/^\d+$/.test(id)) return [];
+
+  const pageSize = opts?.first ?? 500;
+  const optional = opts?.optional ?? true;
+  const maxRetries = opts?.maxRetries ?? (optional ? 6 : 3);
+  const maxItems = opts?.maxItems ?? 5000;
+  const prefix = `${id}-`;
+
+  const all: any[] = [];
+  let lastId = prefix; // `id_gt` cursor; prefix itself is a safe lower bound
+  let started = false;
+
+  while (all.length < maxItems) {
+    let resp: any;
+    try {
+      resp = await fetchJson(graphqlUrl, { query: AGENT_METADATA_COLLECTION_QUERY_BY_ID_CURSOR, variables: { first: pageSize, lastId } }, maxRetries);
+    } catch (e: any) {
+      const msg = String(e?.message || e || '');
+      if (optional) {
+        console.warn(`[subgraph] agentMetadata_collection: skipping targeted cursor fetch (optional=true): ${msg}`);
+        return all;
+      }
+      throw e;
+    }
+
+    if (resp?.errors && Array.isArray(resp.errors) && resp.errors.length > 0) {
+      // Treat schema mismatches / unsupported cursor where as non-fatal in optional mode.
+      const firstErr = resp.errors[0];
+      const msg = String(firstErr?.message || '');
+      if (optional) {
+        console.warn(`[subgraph] agentMetadata_collection: skipping targeted cursor fetch (optional=true). errors=${JSON.stringify(resp.errors, null, 2)}`);
+        return all;
+      }
+      throw new Error(`Subgraph errors: ${msg || 'unknown error'}`);
+    }
+
+    const batch = (resp?.data?.agentMetadata_collection || []) as any[];
+    if (!Array.isArray(batch) || batch.length === 0) break;
+
+    const firstId = typeof batch[0]?.id === 'string' ? batch[0].id.trim() : '';
+    if (started && firstId && !firstId.startsWith(prefix)) {
+      // Because we order by id asc, all further ids will be >= firstId and thus outside the prefix range.
+      break;
+    }
+
+    let matchedThisPage = 0;
+    for (const row of batch) {
+      const rid = typeof row?.id === 'string' ? row.id.trim() : '';
+      if (!rid) continue;
+      if (rid.startsWith(prefix)) {
+        all.push(row);
+        matchedThisPage++;
+        started = true;
+        if (all.length >= maxItems) break;
+      }
+    }
+
+    const newLastId = typeof batch[batch.length - 1]?.id === 'string' ? batch[batch.length - 1].id.trim() : '';
+    if (!newLastId || newLastId === lastId) break;
+    lastId = newLastId;
+
+    // If we didn’t match anything on the very first page, assume there are no rows for this agentId.
+    if (!started && matchedThisPage === 0) break;
+    if (batch.length < pageSize) break;
+  }
+
+  return all;
+}
+
 function isCursorUnsupportedErrorMessage(message: unknown): boolean {
   const msg = String(message ?? '').toLowerCase();
   return (

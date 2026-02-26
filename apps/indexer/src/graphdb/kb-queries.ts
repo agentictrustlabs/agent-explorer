@@ -1019,10 +1019,14 @@ function pickAgentTypesFromRow(typeValues: string[]): string[] {
   return out;
 }
 
-// Chunk size for trust-ledger badge hydrate. GraphDB/HTTP truncate result sets; use 3 agents (~21 bindings) per chunk.
-const TRUST_LEDGER_BADGE_HYDRATE_CHUNK = 3;
-// Page size for badge-award hydration (avoid GraphDB/HTTP result truncation on agents with many awards).
-const TRUST_LEDGER_BADGE_HYDRATE_PAGE_LIMIT = 250;
+// Chunk size for trust-ledger badge hydrate.
+// This is a *major* driver of query count: chunking at 3 agents causes ~67 GraphDB queries for a 200-agent page.
+// With LIMIT/OFFSET paging in place, we can safely hydrate many agents per query when we are not selecting large fields.
+const TRUST_LEDGER_BADGE_HYDRATE_CHUNK = 100;
+// Page size for badge-award hydration.
+// GraphDB/HTTP result sets are effectively truncated around ~200 bindings; keep the LIMIT at/below that so
+// the pagination loop can reliably detect "more pages" via `page.length === pageLimit`.
+const TRUST_LEDGER_BADGE_HYDRATE_PAGE_LIMIT = 200;
 
 function normalizeAgentIriForBadgeMap(iri: string | null): string {
   const s = typeof iri === 'string' ? iri.trim() : '';
@@ -1034,13 +1038,15 @@ async function hydrateTrustLedgerBadgesForAgents(args: {
   agentIris: string[];
   analyticsCtxIri: string;
   graphdbCtx?: GraphdbQueryContext | null;
+  includeEvidenceJson?: boolean;
 }): Promise<Map<string, HydratedTrustLedgerBadgeAward[]>> {
   const agentIris = (args.agentIris || []).map((s) => String(s || '').trim()).filter(Boolean);
   const analyticsCtxIri = String(args.analyticsCtxIri || '').trim();
   if (!agentIris.length || !analyticsCtxIri) return new Map();
 
   const out = new Map<string, HydratedTrustLedgerBadgeAward[]>();
-  const chunkSize = Math.max(1, TRUST_LEDGER_BADGE_HYDRATE_CHUNK);
+  const includeEvidenceJson = args.includeEvidenceJson === true;
+  const chunkSize = Math.max(1, includeEvidenceJson ? 3 : TRUST_LEDGER_BADGE_HYDRATE_CHUNK);
 
   for (let i = 0; i < agentIris.length; i += chunkSize) {
     const chunk = agentIris.slice(i, i + chunkSize);
@@ -1059,7 +1065,7 @@ async function hydrateTrustLedgerBadgesForAgents(args: {
         'PREFIX prov: <http://www.w3.org/ns/prov#>',
         '',
         'SELECT',
-        '  ?agent ?award ?awardedAt ?evidenceJson',
+        ...(includeEvidenceJson ? ['  ?agent ?award ?awardedAt ?evidenceJson'] : ['  ?agent ?award ?awardedAt']),
         // NOTE: Only select the minimal definition fields needed by the GraphQL clients today.
         // The system graph may accumulate multiple values for fields like createdAt/updatedAt across sync runs,
         // which can cause result fanout and trigger GraphDB result-size limits (returning partial badge lists).
@@ -1070,7 +1076,7 @@ async function hydrateTrustLedgerBadgesForAgents(args: {
         '    ?agent analytics:hasTrustLedgerBadgeAward ?award .',
         '    ?award a analytics:TrustLedgerBadgeAward, prov:Entity .',
         '    OPTIONAL { ?award analytics:awardedAt ?awardedAt }',
-        '    OPTIONAL { ?award analytics:evidenceJson ?evidenceJson }',
+        ...(includeEvidenceJson ? ['    OPTIONAL { ?award analytics:evidenceJson ?evidenceJson }'] : []),
         '    OPTIONAL { ?award analytics:awardedBadgeDefinition ?def }',
         '  }',
         '  OPTIONAL {',
@@ -1125,7 +1131,7 @@ async function hydrateTrustLedgerBadgesForAgents(args: {
       if (awardedAt != null) rec.awardedAt = rec.awardedAt == null ? awardedAt : Math.max(rec.awardedAt, awardedAt);
 
       const ev = asString((b as any)?.evidenceJson);
-      if (ev && !rec.evidenceJson) rec.evidenceJson = ev;
+      if (includeEvidenceJson && ev && !rec.evidenceJson) rec.evidenceJson = ev;
 
       const badgeId = asString((b as any)?.badgeId);
       if (badgeId && !rec.definition) {
@@ -1217,7 +1223,15 @@ export async function kbAgentsQuery(args: {
     | 'bestRank'
     | null;
   orderDirection?: 'ASC' | 'DESC' | null;
-}, graphdbCtx?: GraphdbQueryContext | null): Promise<{ rows: KbAgentRow[]; total: number; hasMore: boolean }> {
+},
+graphdbCtx?: GraphdbQueryContext | null,
+opts?: {
+  hydrateIdentities?: boolean;
+  hydrateServiceEndpoints?: boolean;
+  hydrateTrustLedgerBadges?: boolean;
+  includeTrustLedgerBadgeEvidenceJson?: boolean;
+},
+): Promise<{ rows: KbAgentRow[]; total: number; hasMore: boolean }> {
   const where = args.where ?? {};
   const first = clampInt(args.first, 1, 500, 20);
   const skip = clampInt(args.skip, 0, 1_000_000, 0);
@@ -1414,29 +1428,37 @@ export async function kbAgentsQuery(args: {
   }
 
   if (needsAnalytics && analyticsCtxIri) {
+    // PERF: Avoid join fanout against analytics graphs.
+    //
+    // The old pattern joined from ?agent -> analytics:hasTrustLedgerScore ?tls and from ?ati by agentId,
+    // which can explode bindings if there are duplicate score/index nodes (or duplicate properties)
+    // and forces GraphDB to sort a large intermediate result for ORDER BY/LIMIT.
+    //
+    // Instead, derive deterministic analytics IRIs from the agent IRI:
+    // - trust-ledger score:  https://www.agentictrust.io/id/agent-trust-ledger-score/<chainId>/<agentId>
+    // - trust-index (ATI):   https://www.agentictrust.io/id/agent-trust-index/<chainId>/<agentId>
+    //
+    // This turns analytics lookups into simple subject-property reads and keeps the page query stable.
+    const agentPrefix = `https://www.agentictrust.io/id/agent/${chainId}/`;
+    pageOptional.push(`    BIND(STRAFTER(STR(?agent), "${agentPrefix}") AS ?_agentIdStr)`);
     pageOptional.push('    OPTIONAL {');
     pageOptional.push(`      GRAPH <${analyticsCtxIri}> {`);
-    pageOptional.push('        OPTIONAL {');
-    pageOptional.push('          ?agent analytics:hasTrustLedgerScore ?_tls .');
-    pageOptional.push('          ?_tls a analytics:AgentTrustLedgerScore ; analytics:totalPoints ?trustLedgerTotalPoints .');
-    pageOptional.push('          OPTIONAL { ?_tls analytics:badgeCount ?trustLedgerBadgeCount . }');
-    pageOptional.push('          OPTIONAL { ?_tls analytics:trustLedgerComputedAt ?trustLedgerComputedAt . }');
-    pageOptional.push('        }');
-    pageOptional.push('        BIND(IF(BOUND(?agentId8004), STR(?agentId8004), "") AS ?_agentIdStr)');
-    pageOptional.push('        OPTIONAL {');
-    pageOptional.push('          FILTER(?_agentIdStr != "")');
-    pageOptional.push('          ?ati a analytics:AgentTrustIndex ; analytics:agentId ?_agentIdStr ; analytics:overallScore ?atiOverallScore .');
-    pageOptional.push('          OPTIONAL { ?ati analytics:overallConfidence ?atiOverallConfidence . }');
-    pageOptional.push('          OPTIONAL { ?ati analytics:computedAt ?atiComputedAt . }');
-    pageOptional.push('          OPTIONAL { ?ati analytics:version ?atiVersion . }');
-    pageOptional.push('        }');
+    pageOptional.push(`        BIND(IRI(CONCAT("https://www.agentictrust.io/id/agent-trust-ledger-score/${chainId}/", ?_agentIdStr)) AS ?_tlsIri)`);
+    pageOptional.push('        OPTIONAL { ?_tlsIri analytics:totalPoints ?trustLedgerTotalPoints . }');
+    pageOptional.push('        OPTIONAL { ?_tlsIri analytics:badgeCount ?trustLedgerBadgeCount . }');
+    pageOptional.push('        OPTIONAL { ?_tlsIri analytics:trustLedgerComputedAt ?trustLedgerComputedAt . }');
+    pageOptional.push(`        BIND(IRI(CONCAT("https://www.agentictrust.io/id/agent-trust-index/${chainId}/", ?_agentIdStr)) AS ?_atiIri)`);
+    pageOptional.push('        OPTIONAL { ?_atiIri analytics:overallScore ?atiOverallScore . }');
+    pageOptional.push('        OPTIONAL { ?_atiIri analytics:overallConfidence ?atiOverallConfidence . }');
+    pageOptional.push('        OPTIONAL { ?_atiIri analytics:computedAt ?atiComputedAt . }');
+    pageOptional.push('        OPTIONAL { ?_atiIri analytics:version ?atiVersion . }');
     pageOptional.push('      }');
     pageOptional.push('    }');
   }
 
   // Only bind agentId8004 when we need it for ATI joins / explicit ordering.
   const needsAgentId8004 =
-    orderBy === 'agentId8004' || ((orderBy === 'atiOverallScore' || orderBy === 'bestRank') && needsAnalytics);
+    orderBy === 'agentId8004';
   const pageAgentIdPattern = needsAgentId8004 ? ['    OPTIONAL { ?agent erc8004:agentId8004 ?agentId8004 . }'] : [];
 
   // Phase 1: page query (agent ids + graph context only).
@@ -1468,26 +1490,165 @@ export async function kbAgentsQuery(args: {
     : `${pageDistinct ? 'SELECT DISTINCT' : 'SELECT'} ?g ${pageSelectVars} WHERE {`;
 
   const pageSparql = [
-    'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>',
-    'PREFIX core: <https://agentictrust.io/ontology/core#>',
-    'PREFIX erc8004: <https://agentictrust.io/ontology/erc8004#>',
-    'PREFIX dcterms: <http://purl.org/dc/terms/>',
-    ...(needsAnalytics ? ['PREFIX analytics: <https://agentictrust.io/ontology/core/analytics#>'] : []),
-    ...(needsEnsPrefix ? ['PREFIX ens: <https://agentictrust.io/ontology/ens#>'] : []),
-    '',
-    pageSelect,
-    `  ${pageGraphClause}`,
-    '    ?agent a core:AIAgent .',
-    ...pageOptional,
-    ...pageAgentIdPattern,
-    ...pagePreFilter,
-    filters.length ? `    FILTER(${filters.join(' && ')})` : '',
-    `  ${pageGraphClose}`,
-    '}',
-    `ORDER BY ${orderExpr}`,
-    `LIMIT ${first + 1}`,
-    `OFFSET ${skip}`,
-    '',
+    // PERF: For analytics orderings (trust-ledger / ATI / bestRank), drive paging from the analytics graph.
+    //
+    // The "agent-driven" page query (`GRAPH <subgraph> { ?agent a core:AIAgent }` + OPTIONAL analytics lookups)
+    // forces GraphDB to consider *every agent* and then fetch/sort analytics values, which is slow in practice.
+    //
+    // For leaderboard-style pages, we can start from the analytics triples (which already contain the order keys),
+    // then join back to the chain subgraph for existence and optional filters.
+    (() => {
+      const allowFast = process.env.KB_AGENTS_ANALYTICS_PAGE_FAST !== '0';
+      const canFast =
+        allowFast &&
+        Boolean(ctxIri) &&
+        Boolean(analyticsCtxIri) &&
+        needsAnalytics &&
+        wantsAnalyticsOrder &&
+        // Only safe for simple pages (no expensive filters); otherwise the LIMIT page could underfill.
+        filters.length === 0 &&
+        pagePreFilter.length === 0 &&
+        orderDirection === 'DESC';
+
+      if (!canFast) {
+        return [
+          'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>',
+          'PREFIX core: <https://agentictrust.io/ontology/core#>',
+          'PREFIX erc8004: <https://agentictrust.io/ontology/erc8004#>',
+          'PREFIX dcterms: <http://purl.org/dc/terms/>',
+          ...(needsAnalytics ? ['PREFIX analytics: <https://agentictrust.io/ontology/core/analytics#>'] : []),
+          ...(needsEnsPrefix ? ['PREFIX ens: <https://agentictrust.io/ontology/ens#>'] : []),
+          '',
+          pageSelect,
+          `  ${pageGraphClause}`,
+          '    ?agent a core:AIAgent .',
+          ...pageOptional,
+          ...pageAgentIdPattern,
+          ...pagePreFilter,
+          filters.length ? `    FILTER(${filters.join(' && ')})` : '',
+          `  ${pageGraphClose}`,
+          '}',
+          `ORDER BY ${orderExpr}`,
+          `LIMIT ${first + 1}`,
+          `OFFSET ${skip}`,
+          '',
+        ].join('\n');
+      }
+
+      // Fastest path for bestRank: if sync materializes `analytics:bestRank` (1..N) for this chain,
+      // paging is just an indexed numeric ORDER BY with no GROUP BY/MAX joins.
+      if (orderBy === 'bestRank') {
+        const bestRankMaxRaw = Number(process.env.KB_BEST_RANK_MAX);
+        const bestRankMax =
+          Number.isFinite(bestRankMaxRaw) && bestRankMaxRaw > 0 ? Math.trunc(bestRankMaxRaw) : 10_000;
+        // If we only materialize ranks for the top N agents, don’t use this path for deep paging.
+        if (skip >= bestRankMax) {
+          // fall through to the analytics-driven top-K query (slower, but complete).
+        } else {
+        const agentPrefix = `https://www.agentictrust.io/id/agent/${chainId}/`;
+        return [
+          'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>',
+          'PREFIX core: <https://agentictrust.io/ontology/core#>',
+          'PREFIX analytics: <https://agentictrust.io/ontology/core/analytics#>',
+          '',
+          'SELECT ?agent WHERE {',
+          '  {',
+          '    SELECT ?agent (MIN(xsd:integer(?_r)) AS ?bestRank) WHERE {',
+          `      GRAPH <${analyticsCtxIri}> {`,
+          '        ?agent analytics:bestRank ?_r .',
+          `        FILTER(STRSTARTS(STR(?agent), "${agentPrefix}"))`,
+          '      }',
+          `      GRAPH <${ctxIri}> { ?agent a core:AIAgent . }`,
+          '    }',
+          '    GROUP BY ?agent',
+          '    ORDER BY ASC(xsd:integer(?bestRank)) ASC(STR(?agent))',
+          `    LIMIT ${first + 1}`,
+          `    OFFSET ${skip}`,
+          '  }',
+          '}',
+          '',
+        ].join('\n');
+        }
+      }
+
+      const analyticsDrive =
+        orderBy === 'atiOverallScore'
+          ? [
+              '  {',
+              '    SELECT ?agent (MAX(xsd:integer(?_atiScore)) AS ?atiOverallScore) WHERE {',
+              `      GRAPH <${analyticsCtxIri}> {`,
+              '        ?_atiIri analytics:forAgent ?agent ; analytics:overallScore ?_atiScore .',
+              '      }',
+              '    }',
+              '    GROUP BY ?agent',
+              '  }',
+            ]
+          : [
+              '  {',
+              '    SELECT',
+              '      ?agent',
+              '      (MAX(xsd:integer(?_tlp)) AS ?trustLedgerTotalPoints)',
+              ...(orderBy === 'bestRank' ? ['      (MAX(xsd:integer(?_atiScore)) AS ?atiOverallScore)'] : []),
+              '    WHERE {',
+              `      GRAPH <${analyticsCtxIri}> {`,
+              '        ?_tlsIri analytics:trustLedgerForAgent ?agent ; analytics:totalPoints ?_tlp .',
+              ...(orderBy === 'bestRank'
+                ? ['        OPTIONAL { ?_atiIri analytics:forAgent ?agent ; analytics:overallScore ?_atiScore . }']
+                : []),
+              '      }',
+              '    }',
+              '    GROUP BY ?agent',
+              '  }',
+            ];
+
+      const subgraphMust = needsAgentTimes
+        ? [
+            '  {',
+            '    SELECT ?agent (MAX(xsd:integer(?_cat)) AS ?createdAtTime) (MAX(xsd:integer(?_uat)) AS ?updatedAtTime) WHERE {',
+            `      GRAPH <${ctxIri}> {`,
+            '        ?agent a core:AIAgent .',
+            '        OPTIONAL { ?agent core:createdAtTime ?_cat . }',
+            '        OPTIONAL { ?agent core:updatedAtTime ?_uat . }',
+            '      }',
+            '    }',
+            '    GROUP BY ?agent',
+            '  }',
+          ]
+        : [
+            `  GRAPH <${ctxIri}> {`,
+            '    ?agent a core:AIAgent .',
+            '  }',
+          ];
+
+      const fastOrderExpr =
+        orderBy === 'trustLedgerTotalPoints'
+          ? 'DESC(?trustLedgerTotalPoints) ASC(STR(?agent))'
+          : orderBy === 'atiOverallScore'
+            ? 'DESC(?atiOverallScore) ASC(STR(?agent))'
+            : orderBy === 'bestRank'
+              ? 'DESC(?trustLedgerTotalPoints) DESC(COALESCE(?atiOverallScore, 0)) DESC(COALESCE(?createdAtTime, 0)) ASC(STR(?agent))'
+              : orderExpr;
+
+      return [
+        'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>',
+        'PREFIX core: <https://agentictrust.io/ontology/core#>',
+        'PREFIX analytics: <https://agentictrust.io/ontology/core/analytics#>',
+        '',
+        'SELECT ?agent WHERE {',
+        '  {',
+        `    SELECT ${orderBy === 'atiOverallScore' ? '?agent ?atiOverallScore' : orderBy === 'trustLedgerTotalPoints' ? '?agent ?trustLedgerTotalPoints' : '?agent ?trustLedgerTotalPoints ?atiOverallScore ?createdAtTime'} WHERE {`,
+        ...analyticsDrive.map((l) => `      ${l.trimEnd()}`),
+        ...subgraphMust.map((l) => `      ${l.trimEnd()}`),
+        '    }',
+        `    ORDER BY ${fastOrderExpr}`,
+        `    LIMIT ${first + 1}`,
+        `    OFFSET ${skip}`,
+        '  }',
+        '',
+        '}',
+        '',
+      ].join('\n');
+    })(),
   ].join('\n');
 
   const pageBindings = await runGraphdbQuery(pageSparql, graphdbCtx, 'kbAgentsQuery.page');
@@ -1864,7 +2025,28 @@ export async function kbAgentsQuery(args: {
         'PREFIX schema: <http://schema.org/>',
         'PREFIX analytics: <https://agentictrust.io/ontology/core/analytics#>',
         '',
-        'SELECT ?agent ?uaid ?agentName ?agentImage ?agentDesc ?agentDescTitle ?agentDescDescription ?agentDescImage ?agentTypes ?feedbackAssertionCount ?validationAssertionCount ?createdAtTime ?updatedAtTime ?trustLedgerTotalPoints ?trustLedgerBadgeCount ?trustLedgerComputedAt ?atiOverallScore ?atiOverallConfidence ?atiVersion ?atiComputedAt WHERE {',
+        'SELECT',
+        '  ?agent',
+        '  (SAMPLE(?uaid) AS ?uaid)',
+        '  (SAMPLE(?agentName) AS ?agentName)',
+        '  (SAMPLE(?agentImage) AS ?agentImage)',
+        '  (SAMPLE(?agentDesc) AS ?agentDesc)',
+        '  (SAMPLE(?agentDescTitle) AS ?agentDescTitle)',
+        '  (SAMPLE(?agentDescDescription) AS ?agentDescDescription)',
+        '  (SAMPLE(?agentDescImage) AS ?agentDescImage)',
+        '  (SAMPLE(?agentTypes) AS ?agentTypes)',
+        '  (SAMPLE(?feedbackAssertionCount) AS ?feedbackAssertionCount)',
+        '  (SAMPLE(?validationAssertionCount) AS ?validationAssertionCount)',
+        '  (SAMPLE(?createdAtTime) AS ?createdAtTime)',
+        '  (SAMPLE(?updatedAtTime) AS ?updatedAtTime)',
+        '  (SAMPLE(?trustLedgerTotalPoints) AS ?trustLedgerTotalPoints)',
+        '  (SAMPLE(?trustLedgerBadgeCount) AS ?trustLedgerBadgeCount)',
+        '  (SAMPLE(?trustLedgerComputedAt) AS ?trustLedgerComputedAt)',
+        '  (SAMPLE(?atiOverallScore) AS ?atiOverallScore)',
+        '  (SAMPLE(?atiOverallConfidence) AS ?atiOverallConfidence)',
+        '  (SAMPLE(?atiVersion) AS ?atiVersion)',
+        '  (SAMPLE(?atiComputedAt) AS ?atiComputedAt)',
+        'WHERE {',
         ctxIri ? `  VALUES ?agent { ${valuesAgents} }` : `  VALUES (?g ?agent) { ${valuesPairs} }`,
         ctxIri ? `  GRAPH <${ctxIri}> {` : '  GRAPH ?g {',
         '    ?agent a core:AIAgent .',
@@ -1908,6 +2090,7 @@ export async function kbAgentsQuery(args: {
             ]
           : []),
         '}',
+        'GROUP BY ?agent',
         '',
       ].join('\n');
       rowsBindings = await runGraphdbQuery(fallbackSparql, graphdbCtx, 'kbAgentsQuery.hydrate');
@@ -2054,68 +2237,85 @@ export async function kbAgentsQuery(args: {
     ? trimmedAgents.map((iri) => byIri.get(iri)).filter((x): x is KbAgentRow => Boolean(x))
     : trimmedPairs.map((p) => byIri.get(p.agent)).filter((x): x is KbAgentRow => Boolean(x));
 
+  const hydrateIdentities = opts?.hydrateIdentities !== false;
+  const hydrateServiceEndpoints = opts?.hydrateServiceEndpoints !== false;
+  const hydrateTrustLedgerBadges = opts?.hydrateTrustLedgerBadges !== false;
+  const includeTrustLedgerBadgeEvidenceJson = opts?.includeTrustLedgerBadgeEvidenceJson === true;
+
+  // Always materialize list fields to a stable shape (schema uses non-null lists).
+  for (const r of ordered) {
+    r.identities = [];
+    r.trustLedgerBadges = [];
+  }
+
   // Identity hydration: even when using the lightweight hydrate query, attach identities so GraphQL can
   // return the new `KbAgent.identities` list reliably.
   if (ordered.length) {
-    try {
-      const identMap = ctxIri
-        ? await hydrateIdentitiesForAgents({ agentIris: ordered.map((r) => r.iri), ctxIri, graphdbCtx })
-        : await hydrateIdentitiesForPairs({ pairs: trimmedPairs, graphdbCtx });
-      for (const r of ordered) {
-        // Always materialize identities as an array (even empty) so GraphQL resolvers
-        // can rely on it without falling back to legacy singleton fields.
-        const ids = identMap.get(r.iri) ?? [];
-        r.identities = ids;
+    if (hydrateIdentities) {
+      try {
+        const identMap = ctxIri
+          ? await hydrateIdentitiesForAgents({ agentIris: ordered.map((r) => r.iri), ctxIri, graphdbCtx })
+          : await hydrateIdentitiesForPairs({ pairs: trimmedPairs, graphdbCtx });
+        for (const r of ordered) {
+          // Always materialize identities as an array (even empty) so GraphQL resolvers
+          // can rely on it without falling back to legacy singleton fields.
+          const ids = identMap.get(r.iri) ?? [];
+          r.identities = ids;
+        }
+      } catch (e: any) {
+        // Non-fatal: keep agent list functional even if identity hydrate fails.
+        // eslint-disable-next-line no-console
+        console.warn('[kbAgentsQuery] identity hydrate failed (non-fatal)', { error: String(e?.message || e || '') });
+        // Still set identities=[] so callers get a stable shape.
+        for (const r of ordered) r.identities = [];
       }
-    } catch (e: any) {
-      // Non-fatal: keep agent list functional even if identity hydrate fails.
-      // eslint-disable-next-line no-console
-      console.warn('[kbAgentsQuery] identity hydrate failed (non-fatal)', { error: String(e?.message || e || '') });
-      // Still set identities=[] so callers get a stable shape.
-      for (const r of ordered) r.identities = [];
     }
 
     // Service endpoint hydration: the lightweight hydrate query intentionally omits these fields.
     // Hydrate them separately so `KbAgent.serviceEndpoints` returns KB materialized data.
-    try {
-      const seMap = ctxIri
-        ? await hydrateServiceEndpointsForAgents({ agentIris: ordered.map((r) => r.iri), ctxIri, graphdbCtx })
-        : await hydrateServiceEndpointsForPairs({ pairs: trimmedPairs, graphdbCtx });
-      for (const r of ordered) {
-        const se = seMap.get(r.iri);
-        if (!se) continue;
+    if (hydrateServiceEndpoints) {
+      try {
+        const seMap = ctxIri
+          ? await hydrateServiceEndpointsForAgents({ agentIris: ordered.map((r) => r.iri), ctxIri, graphdbCtx })
+          : await hydrateServiceEndpointsForPairs({ pairs: trimmedPairs, graphdbCtx });
+        for (const r of ordered) {
+          const se = seMap.get(r.iri);
+          if (!se) continue;
 
-        r.a2aServiceEndpointIri = r.a2aServiceEndpointIri ?? se.a2aServiceEndpointIri;
-        r.a2aProtocolIri = r.a2aProtocolIri ?? se.a2aProtocolIri;
-        r.a2aServiceUrl = r.a2aServiceUrl ?? se.a2aServiceUrl;
-        r.a2aServiceEndpointDescriptorIri = r.a2aServiceEndpointDescriptorIri ?? se.a2aServiceEndpointDescriptorIri;
-        r.a2aProtocolDescriptorIri = r.a2aProtocolDescriptorIri ?? se.a2aProtocolDescriptorIri;
-        r.a2aProtocolVersion = r.a2aProtocolVersion ?? se.a2aProtocolVersion;
-        r.a2aAgentCardJson = r.a2aAgentCardJson ?? se.a2aAgentCardJson;
+          r.a2aServiceEndpointIri = r.a2aServiceEndpointIri ?? se.a2aServiceEndpointIri;
+          r.a2aProtocolIri = r.a2aProtocolIri ?? se.a2aProtocolIri;
+          r.a2aServiceUrl = r.a2aServiceUrl ?? se.a2aServiceUrl;
+          r.a2aServiceEndpointDescriptorIri = r.a2aServiceEndpointDescriptorIri ?? se.a2aServiceEndpointDescriptorIri;
+          r.a2aProtocolDescriptorIri = r.a2aProtocolDescriptorIri ?? se.a2aProtocolDescriptorIri;
+          r.a2aProtocolVersion = r.a2aProtocolVersion ?? se.a2aProtocolVersion;
+          r.a2aAgentCardJson = r.a2aAgentCardJson ?? se.a2aAgentCardJson;
 
-        r.mcpServiceEndpointIri = r.mcpServiceEndpointIri ?? se.mcpServiceEndpointIri;
-        r.mcpProtocolIri = r.mcpProtocolIri ?? se.mcpProtocolIri;
-        r.mcpServiceUrl = r.mcpServiceUrl ?? se.mcpServiceUrl;
-        r.mcpServiceEndpointDescriptorIri = r.mcpServiceEndpointDescriptorIri ?? se.mcpServiceEndpointDescriptorIri;
-        r.mcpProtocolDescriptorIri = r.mcpProtocolDescriptorIri ?? se.mcpProtocolDescriptorIri;
-        r.mcpProtocolVersion = r.mcpProtocolVersion ?? se.mcpProtocolVersion;
-        r.mcpAgentCardJson = r.mcpAgentCardJson ?? se.mcpAgentCardJson;
+          r.mcpServiceEndpointIri = r.mcpServiceEndpointIri ?? se.mcpServiceEndpointIri;
+          r.mcpProtocolIri = r.mcpProtocolIri ?? se.mcpProtocolIri;
+          r.mcpServiceUrl = r.mcpServiceUrl ?? se.mcpServiceUrl;
+          r.mcpServiceEndpointDescriptorIri = r.mcpServiceEndpointDescriptorIri ?? se.mcpServiceEndpointDescriptorIri;
+          r.mcpProtocolDescriptorIri = r.mcpProtocolDescriptorIri ?? se.mcpProtocolDescriptorIri;
+          r.mcpProtocolVersion = r.mcpProtocolVersion ?? se.mcpProtocolVersion;
+          r.mcpAgentCardJson = r.mcpAgentCardJson ?? se.mcpAgentCardJson;
+        }
+      } catch (e: any) {
+        // eslint-disable-next-line no-console
+        console.warn('[kbAgentsQuery] service endpoint hydrate failed (non-fatal)', { error: String(e?.message || e || '') });
       }
-    } catch (e: any) {
-      // eslint-disable-next-line no-console
-      console.warn('[kbAgentsQuery] service endpoint hydrate failed (non-fatal)', { error: String(e?.message || e || '') });
     }
 
     // Trust ledger badges: batch hydrate badge awards + definition info for the page.
     // Requires analytics context (per chain). When chainId in where: use it. Otherwise derive from agent IRI or graph.
-    for (const r of ordered) r.trustLedgerBadges = [];
-    if (analyticsCtxIri) {
+    if (!hydrateTrustLedgerBadges) {
+      for (const r of ordered) r.trustLedgerBadges = [];
+    } else if (analyticsCtxIri) {
       try {
         const agentIrisForBadges = ordered.map((r) => r.iri);
         const badgeMap = await hydrateTrustLedgerBadgesForAgents({
           agentIris: agentIrisForBadges,
           analyticsCtxIri,
           graphdbCtx,
+          includeEvidenceJson: includeTrustLedgerBadgeEvidenceJson,
         });
         for (const r of ordered) {
           const key = normalizeAgentIriForBadgeMap(r.iri);
@@ -2166,6 +2366,7 @@ export async function kbAgentsQuery(args: {
             agentIris,
             analyticsCtxIri: ctx,
             graphdbCtx,
+            includeEvidenceJson: includeTrustLedgerBadgeEvidenceJson,
           });
           for (const r of ordered) {
             const key = normalizeAgentIriForBadgeMap(r.iri);
@@ -2188,6 +2389,7 @@ export async function kbAgentsQuery(args: {
             agentIris: ordered.map((r) => r.iri),
             analyticsCtxIri: analyticsContext(derivedChainId),
             graphdbCtx,
+            includeEvidenceJson: includeTrustLedgerBadgeEvidenceJson,
           });
           for (const r of ordered) {
             const key = normalizeAgentIriForBadgeMap(r.iri);
@@ -2201,7 +2403,11 @@ export async function kbAgentsQuery(args: {
     }
   }
 
-  return { rows: ordered, total: Number.isFinite(total) ? total : 0, hasMore };
+  const totalOut = Number.isFinite(total) ? total : 0;
+  // GraphDB/HTTP can truncate SELECT result sets around ~200 bindings, which breaks the "LIMIT first+1"
+  // technique for `hasMore`. We already run a COUNT query; use it to compute hasMore deterministically.
+  const hasMoreOut = totalOut > 0 ? skip + ordered.length < totalOut : hasMore;
+  return { rows: ordered, total: totalOut, hasMore: hasMoreOut };
 }
 
 /**

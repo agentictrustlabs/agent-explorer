@@ -299,30 +299,30 @@ export default {
         typeDefs: graphQLSchemaStringKb + extraSyncTypeDefs,
         resolvers: {
           Query: {
-            oasfSkills: (_p: any, args: any) => sharedKb.oasfSkills(args),
-            oasfDomains: (_p: any, args: any) => sharedKb.oasfDomains(args),
-            intentTypes: (_p: any, args: any) => sharedKb.intentTypes(args),
-            taskTypes: (_p: any, args: any) => sharedKb.taskTypes(args),
-            intentTaskMappings: (_p: any, args: any) => sharedKb.intentTaskMappings(args),
-            kbAgents: (_p: any, args: any) => sharedKb.kbAgents(args),
-                kbOwnedAgents: (_p: any, args: any) => sharedKb.kbOwnedAgents(args),
-                kbOwnedAgentsAllChains: (_p: any, args: any) => sharedKb.kbOwnedAgentsAllChains(args),
-                kbIsOwner: (_p: any, args: any) => sharedKb.kbIsOwner(args),
-                kbAgentByUaid: (_p: any, args: any) => sharedKb.kbAgentByUaid(args),
-            kbHolAgentProfileByUaid: (_p: any, args: any) => sharedKb.kbHolAgentProfileByUaid(args),
-            kbHolCapabilities: (_p: any, args: any) => sharedKb.kbHolCapabilities(args),
-            kbHolRegistries: (_p: any, args: any) => sharedKb.kbHolRegistries(args),
-            kbHolRegistriesForProtocol: (_p: any, args: any) => sharedKb.kbHolRegistriesForProtocol(args),
-            kbHolStats: (_p: any, args: any) => sharedKb.kbHolStats(args),
-            kbHolRegistrySearch: (_p: any, args: any) => sharedKb.kbHolRegistrySearch(args),
-            kbHolVectorSearch: (_p: any, args: any) => sharedKb.kbHolVectorSearch(args),
-            kbSemanticAgentSearch: (_p: any, args: any) => sharedKb.kbSemanticAgentSearch(args),
-            kbErc8122Registries: (_p: any, args: any) => sharedKb.kbErc8122Registries(args),
-                kbReviews: (_p: any, args: any) => sharedKb.kbReviews(args),
-            kbValidations: (_p: any, args: any) => sharedKb.kbValidations(args),
-            kbAssociations: (_p: any, args: any) => sharedKb.kbAssociations(args),
-            kbAgentTrustIndex: (_p: any, args: any) => sharedKb.kbAgentTrustIndex(args),
-            kbTrustLedgerBadgeDefinitions: (_p: any, args: any) => sharedKb.kbTrustLedgerBadgeDefinitions(args),
+            oasfSkills: (_p: any, args: any, ctx: any) => sharedKb.oasfSkills(args, ctx),
+            oasfDomains: (_p: any, args: any, ctx: any) => sharedKb.oasfDomains(args, ctx),
+            intentTypes: (_p: any, args: any, ctx: any) => sharedKb.intentTypes(args, ctx),
+            taskTypes: (_p: any, args: any, ctx: any) => sharedKb.taskTypes(args, ctx),
+            intentTaskMappings: (_p: any, args: any, ctx: any) => sharedKb.intentTaskMappings(args, ctx),
+            kbAgents: (_p: any, args: any, ctx: any, info: any) => sharedKb.kbAgents(args, ctx, info),
+            kbOwnedAgents: (_p: any, args: any, ctx: any) => sharedKb.kbOwnedAgents(args, ctx),
+            kbOwnedAgentsAllChains: (_p: any, args: any, ctx: any) => sharedKb.kbOwnedAgentsAllChains(args, ctx),
+            kbIsOwner: (_p: any, args: any, ctx: any) => sharedKb.kbIsOwner(args, ctx),
+            kbAgentByUaid: (_p: any, args: any, ctx: any) => sharedKb.kbAgentByUaid(args, ctx),
+            kbHolAgentProfileByUaid: (_p: any, args: any, ctx: any) => sharedKb.kbHolAgentProfileByUaid(args, ctx),
+            kbHolCapabilities: (_p: any, args: any, ctx: any) => sharedKb.kbHolCapabilities(args, ctx),
+            kbHolRegistries: (_p: any, args: any, ctx: any) => sharedKb.kbHolRegistries(args, ctx),
+            kbHolRegistriesForProtocol: (_p: any, args: any, ctx: any) => sharedKb.kbHolRegistriesForProtocol(args, ctx),
+            kbHolStats: (_p: any, args: any, ctx: any) => sharedKb.kbHolStats(args, ctx),
+            kbHolRegistrySearch: (_p: any, args: any, ctx: any) => sharedKb.kbHolRegistrySearch(args, ctx),
+            kbHolVectorSearch: (_p: any, args: any, ctx: any) => sharedKb.kbHolVectorSearch(args, ctx),
+            kbSemanticAgentSearch: (_p: any, args: any, ctx: any) => sharedKb.kbSemanticAgentSearch(args, ctx),
+            kbErc8122Registries: (_p: any, args: any, ctx: any) => sharedKb.kbErc8122Registries(args, ctx),
+            kbReviews: (_p: any, args: any, ctx: any) => sharedKb.kbReviews(args, ctx),
+            kbValidations: (_p: any, args: any, ctx: any) => sharedKb.kbValidations(args, ctx),
+            kbAssociations: (_p: any, args: any, ctx: any) => sharedKb.kbAssociations(args, ctx),
+            kbAgentTrustIndex: (_p: any, args: any, ctx: any) => sharedKb.kbAgentTrustIndex(args, ctx),
+            kbTrustLedgerBadgeDefinitions: (_p: any, args: any, ctx: any) => sharedKb.kbTrustLedgerBadgeDefinitions(args, ctx),
             kbSyncJob: async (_p: any, args: any) => {
               const id = typeof args?.id === 'string' ? args.id.trim() : '';
               if (!id) return null;
@@ -348,7 +348,7 @@ export default {
             },
           },
           Mutation: {
-            kbHolSyncCapabilities: (_p: any, args: any) => sharedKb.kbHolSyncCapabilities(args),
+            kbHolSyncCapabilities: (_p: any, args: any, ctx: any) => sharedKb.kbHolSyncCapabilities(args, ctx),
             kbSyncAgentPipeline: async (_p: any, args: any) => {
               const chainIds = Array.isArray(args?.chainIds) ? args.chainIds : [];
               const id = crypto.randomUUID();
@@ -397,6 +397,8 @@ export default {
       graphqlEndpoint: isKb ? '/graphql-kb' : '/graphql',
       maskedErrors: false,
       context: async ({ request }) => {
+        const requestId = request.headers.get('x-request-id') || crypto.randomUUID();
+        const timings: Array<{ label: string; ms: number; resultBindings?: number | null }> = [];
         // Parse minimal GraphQL details to decide auth
         let query = '';
         let operationName: string | undefined = undefined;
@@ -424,13 +426,26 @@ export default {
         }
 
         if (isKb) {
-          // KB schema doesn't use ctx.dbQueries
-          return {};
+          // KB schema uses GraphDB; provide request-level cache + timing collection like local servers.
+          return {
+            graphdb: {
+              requestId,
+              requestCache: new Map<string, Promise<any>>(),
+              timings,
+            },
+          };
         }
 
         // v1 schema: Build per-request DB resolvers (with Workers-aware indexAgent)
         const dbQueries = await createWorkersDBQueries(env.DB, env);
-        return { dbQueries };
+        return {
+          dbQueries,
+          graphdb: {
+            requestId,
+            requestCache: new Map<string, Promise<any>>(),
+            timings,
+          },
+        };
       },
     });
 

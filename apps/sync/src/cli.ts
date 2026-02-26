@@ -13,8 +13,8 @@ import {
   fetchAgentMintedAtById,
   fetchAgentById,
   AGENT_METADATA_COLLECTION_QUERY,
-  AGENT_METADATA_COLLECTION_QUERY_BY_ID_PREFIX,
   AGENT_METADATA_COLLECTION_QUERY_BY_ID_CURSOR,
+  fetchAgentMetadataCollectionForAgentId,
   FEEDBACKS_QUERY,
   FEEDBACK_REVOCATIONS_QUERY,
   FEEDBACK_RESPONSES_QUERY,
@@ -62,6 +62,7 @@ import { runTrustIndexForChains } from './trust-index/trust-index.js';
 import { materializeRegistrationServicesForChain } from './registration/materialize-services.js';
 import { materializeAssertionSummariesForChain } from './trust-summaries/materialize-assertion-summaries.js';
 import { syncTrustLedgerToGraphdbForChain } from './trust-ledger/sync-trust-ledger.js';
+import { materializeBestRankIndexForChain } from './rank-index/materialize-best-rank.js';
 import { syncMcpForAgentIds, syncMcpForChain } from './mcp/mcp-sync.js';
 import { ensParentNameForTargetChain, syncEnsParentForChain } from './ens/ens-parent-sync.js';
 import { ensureRepositoryExistsOrThrow, getGraphdbConfigFromEnv, queryGraphdb, updateGraphdb } from './graphdb-http.js';
@@ -522,32 +523,18 @@ export async function syncSingleAgent(
     console.warn('[sync] [syncSingleAgent] clear failed (non-fatal)', { chainId: endpoint.chainId, agentId: id, error: String(e?.message || e || '') });
   }
   // Attach on-chain agent metadata KV rows (required for agentAccount/UAID canonicalization and SmartAgent linking).
-  const prefix = `${id}-`;
-  let metas = await fetchAllFromSubgraph(endpoint.url, AGENT_METADATA_COLLECTION_QUERY_BY_ID_PREFIX, 'agentMetadata_collection', {
-    optional: true,
-    first: 500,
-    maxSkip: 5000,
-    buildVariables: ({ first, skip }) => ({ first, skip, prefix }),
-  }).catch(() => []);
-  // Fallback: some subgraphs (including our Sepolia deployments) don't support where filters on agentMetadata_collection.
-  // In that case, fetch the whole collection (bounded by skip cap) and filter client-side for this agentId.
+  // Avoid schema-dependent `where: { id_starts_with: ... }` (not supported on some subgraphs) and skip<=5000 limits.
+  let metas = await fetchAgentMetadataCollectionForAgentId(endpoint.url, id, { optional: true, first: 500, maxItems: 5000 }).catch(
+    () => [],
+  );
+  // Last-resort fallback (bounded): small skip-based scan + client-side filter.
   if (!Array.isArray(metas) || metas.length === 0) {
     const all = await fetchAllFromSubgraph(endpoint.url, AGENT_METADATA_COLLECTION_QUERY, 'agentMetadata_collection', {
       optional: true,
       first: 500,
-      maxSkip: 50_000,
+      maxSkip: 5000,
     }).catch(() => []);
-    const matches = Array.isArray(all)
-      ? all.filter((m: any) => {
-          const mid = typeof m?.id === 'string' ? m.id.trim() : '';
-          if (!mid) return false;
-          // Most common patterns are "<agentId>-<key>" or "<agentId>:<key>"
-          if (mid.startsWith(`${id}-`) || mid.startsWith(`${id}:`)) return true;
-          // Fallback: match the numeric id as a standalone token in odd id formats
-          return new RegExp(`\\b${id}\\b`).test(mid);
-        })
-      : [];
-    metas = matches;
+    metas = Array.isArray(all) ? all.filter((m: any) => String(m?.id ?? '').trim().startsWith(`${id}-`)) : [];
   }
   const rowWithMetas = { ...row, agentMetadatas: Array.isArray(metas) ? metas : [] };
   const { turtle } = emitAgentsTurtle(endpoint.chainId, [rowWithMetas], 'mintedAt', -1n);
@@ -573,109 +560,109 @@ PREFIX erc8004: <https://agentictrust.io/ontology/erc8004#>
 WITH <${ctx}>
 DELETE { ?node ?p ?o . }
 WHERE {
+  # IMPORTANT: avoid SELECT DISTINCT/GROUP BY here.
+  # GraphDB can throw NotEnoughMemoryForDistinctGroupBy even for small per-agent clears.
   {
-    SELECT DISTINCT ?node WHERE {
-      {
-        ?id a erc8004:AgentIdentity8004 ;
-            erc8004:agentId ${agentIdInt} ;
-            core:identityOf ?agent .
-        BIND(?agent AS ?node)
-      }
-      UNION
-      {
-        ?id a erc8004:AgentIdentity8004 ;
-            erc8004:agentId ${agentIdInt} ;
-            core:identityOf ?agent .
-        BIND(?id AS ?node)
-      }
-      UNION
-      {
-        ?id a erc8004:AgentIdentity8004 ;
-            erc8004:agentId ${agentIdInt} ;
-            core:identityOf ?agent .
-        ?agent core:hasDescriptor ?agentDesc .
-        BIND(?agentDesc AS ?node)
-      }
-      UNION
-      {
-        ?id a erc8004:AgentIdentity8004 ;
-            erc8004:agentId ${agentIdInt} ;
-            core:identityOf ?agent .
-        ?id core:hasDescriptor ?desc .
-        BIND(?desc AS ?node)
-      }
-      UNION
-      {
-        ?id a erc8004:AgentIdentity8004 ;
-            erc8004:agentId ${agentIdInt} ;
-            core:identityOf ?agent .
-        ?id core:hasIdentifier ?ident .
-        BIND(?ident AS ?node)
-      }
-      UNION
-      {
-        ?id a erc8004:AgentIdentity8004 ;
-            erc8004:agentId ${agentIdInt} ;
-            core:identityOf ?agent .
-        ?agent core:hasServiceEndpoint ?se .
-        BIND(?se AS ?node)
-      }
-      UNION
-      {
-        ?id a erc8004:AgentIdentity8004 ;
-            erc8004:agentId ${agentIdInt} ;
-            core:identityOf ?agent .
-        ?id core:hasServiceEndpoint ?se .
-        BIND(?se AS ?node)
-      }
-      UNION
-      {
-        ?id a erc8004:AgentIdentity8004 ;
-            erc8004:agentId ${agentIdInt} ;
-            core:identityOf ?agent .
-        ?id core:hasServiceEndpoint ?se .
-        ?se core:hasDescriptor ?seDesc .
-        BIND(?seDesc AS ?node)
-      }
-      UNION
-      {
-        ?id a erc8004:AgentIdentity8004 ;
-            erc8004:agentId ${agentIdInt} ;
-            core:identityOf ?agent .
-        ?id core:hasServiceEndpoint ?se .
-        ?se core:hasProtocol ?proto .
-        BIND(?proto AS ?node)
-      }
-      UNION
-      {
-        ?id a erc8004:AgentIdentity8004 ;
-            erc8004:agentId ${agentIdInt} ;
-            core:identityOf ?agent .
-        ?id core:hasServiceEndpoint ?se .
-        ?se core:hasProtocol ?proto .
-        ?proto core:hasDescriptor ?protoDesc .
-        BIND(?protoDesc AS ?node)
-      }
-      UNION
-      {
-        ?id a erc8004:AgentIdentity8004 ;
-            erc8004:agentId ${agentIdInt} ;
-            core:identityOf ?agent .
-        ?id core:hasServiceEndpoint ?se .
-        ?se core:hasProtocol ?proto .
-        ?proto core:hasSkill ?sk .
-        BIND(?sk AS ?node)
-      }
-      UNION
-      {
-        ?id a erc8004:AgentIdentity8004 ;
-            erc8004:agentId ${agentIdInt} ;
-            core:identityOf ?agent .
-        ?id core:hasServiceEndpoint ?se .
-        ?se core:hasProtocol ?proto .
-        ?proto core:hasDomain ?dm .
-        BIND(?dm AS ?node)
-      }
+    {
+      ?id a erc8004:AgentIdentity8004 ;
+          erc8004:agentId ${agentIdInt} ;
+          core:identityOf ?agent .
+      BIND(?agent AS ?node)
+    }
+    UNION
+    {
+      ?id a erc8004:AgentIdentity8004 ;
+          erc8004:agentId ${agentIdInt} ;
+          core:identityOf ?agent .
+      BIND(?id AS ?node)
+    }
+    UNION
+    {
+      ?id a erc8004:AgentIdentity8004 ;
+          erc8004:agentId ${agentIdInt} ;
+          core:identityOf ?agent .
+      ?agent core:hasDescriptor ?agentDesc .
+      BIND(?agentDesc AS ?node)
+    }
+    UNION
+    {
+      ?id a erc8004:AgentIdentity8004 ;
+          erc8004:agentId ${agentIdInt} ;
+          core:identityOf ?agent .
+      ?id core:hasDescriptor ?desc .
+      BIND(?desc AS ?node)
+    }
+    UNION
+    {
+      ?id a erc8004:AgentIdentity8004 ;
+          erc8004:agentId ${agentIdInt} ;
+          core:identityOf ?agent .
+      ?id core:hasIdentifier ?ident .
+      BIND(?ident AS ?node)
+    }
+    UNION
+    {
+      ?id a erc8004:AgentIdentity8004 ;
+          erc8004:agentId ${agentIdInt} ;
+          core:identityOf ?agent .
+      ?agent core:hasServiceEndpoint ?se .
+      BIND(?se AS ?node)
+    }
+    UNION
+    {
+      ?id a erc8004:AgentIdentity8004 ;
+          erc8004:agentId ${agentIdInt} ;
+          core:identityOf ?agent .
+      ?id core:hasServiceEndpoint ?se .
+      BIND(?se AS ?node)
+    }
+    UNION
+    {
+      ?id a erc8004:AgentIdentity8004 ;
+          erc8004:agentId ${agentIdInt} ;
+          core:identityOf ?agent .
+      ?id core:hasServiceEndpoint ?se .
+      ?se core:hasDescriptor ?seDesc .
+      BIND(?seDesc AS ?node)
+    }
+    UNION
+    {
+      ?id a erc8004:AgentIdentity8004 ;
+          erc8004:agentId ${agentIdInt} ;
+          core:identityOf ?agent .
+      ?id core:hasServiceEndpoint ?se .
+      ?se core:hasProtocol ?proto .
+      BIND(?proto AS ?node)
+    }
+    UNION
+    {
+      ?id a erc8004:AgentIdentity8004 ;
+          erc8004:agentId ${agentIdInt} ;
+          core:identityOf ?agent .
+      ?id core:hasServiceEndpoint ?se .
+      ?se core:hasProtocol ?proto .
+      ?proto core:hasDescriptor ?protoDesc .
+      BIND(?protoDesc AS ?node)
+    }
+    UNION
+    {
+      ?id a erc8004:AgentIdentity8004 ;
+          erc8004:agentId ${agentIdInt} ;
+          core:identityOf ?agent .
+      ?id core:hasServiceEndpoint ?se .
+      ?se core:hasProtocol ?proto .
+      ?proto core:hasSkill ?sk .
+      BIND(?sk AS ?node)
+    }
+    UNION
+    {
+      ?id a erc8004:AgentIdentity8004 ;
+          erc8004:agentId ${agentIdInt} ;
+          core:identityOf ?agent .
+      ?id core:hasServiceEndpoint ?se .
+      ?se core:hasProtocol ?proto .
+      ?proto core:hasDomain ?dm .
+      BIND(?dm AS ?node)
     }
   }
   ?node ?p ?o .
@@ -1459,6 +1446,9 @@ async function runSync(command: SyncCommand, resetContext: boolean = false) {
     await materializeAssertionSummariesForChain(chainId, {});
     await runTrustIndexForChains({ chainIdsCsv: String(chainId), resetContext: true });
     await syncTrustLedgerToGraphdbForChain(chainId, { resetContext: true });
+    await materializeBestRankIndexForChain(chainId, { force: true, minAgeSeconds: 0 }).catch((e: any) => {
+      console.warn('[sync] [reset-chain-agents] best-rank index failed (non-fatal)', { chainId, error: String(e?.message || e || '') });
+    });
     console.info('[sync] [reset-chain-agents] done', { chainId });
     return;
   }
@@ -1599,6 +1589,13 @@ async function runSync(command: SyncCommand, resetContext: boolean = false) {
       await runTrustIndexForChains({ chainIdsCsv: String(chainId), resetContext: false, agentIds });
       const tTrustIndex = fullTiming ? Date.now() : 0;
       await syncTrustLedgerToGraphdbForChain(chainId, { agentIds });
+      if (process.env.SYNC_MATERIALIZE_BEST_RANK === '1' || process.env.SYNC_MATERIALIZE_BEST_RANK === 'true') {
+        const maxRanksRaw = Number(process.env.SYNC_BEST_RANK_MAX);
+        const maxRanks = Number.isFinite(maxRanksRaw) && maxRanksRaw > 0 ? Math.trunc(maxRanksRaw) : 10_000;
+        await materializeBestRankIndexForChain(chainId, { force: false, minAgeSeconds: 60 * 60, maxRanks }).catch((e: any) => {
+          console.warn('[sync] [agent-pipeline] best-rank index failed (non-fatal)', { chainId, error: String(e?.message || e || '') });
+        });
+      }
       const tEnd = Date.now();
       if (fullTiming) {
         console.info('[sync] [agent-pipeline] batch complete', {
@@ -1662,6 +1659,13 @@ async function runSync(command: SyncCommand, resetContext: boolean = false) {
       }
     }
       await syncTrustLedgerToGraphdbForChain(chainId, { agentIds });
+      if (process.env.SYNC_MATERIALIZE_BEST_RANK === '1' || process.env.SYNC_MATERIALIZE_BEST_RANK === 'true') {
+        const maxRanksRaw = Number(process.env.SYNC_BEST_RANK_MAX);
+        const maxRanks = Number.isFinite(maxRanksRaw) && maxRanksRaw > 0 ? Math.trunc(maxRanksRaw) : 10_000;
+        await materializeBestRankIndexForChain(chainId, { force: false, minAgeSeconds: 60 * 60, maxRanks }).catch((e: any) => {
+          console.warn('[sync] [agent-pipeline] best-rank index failed (non-fatal)', { chainId, error: String(e?.message || e || '') });
+        });
+      }
     }
 
     // ENS parent sync: materialize subdomains (e.g. *.8004-agent.eth) into this chain's KB context.
