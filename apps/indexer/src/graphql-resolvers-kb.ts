@@ -1254,7 +1254,7 @@ LIMIT 1
       return walletEoa === agentOwnerEoa;
     },
 
-    kbAgentByUaid: async (args: any, ctx: any) => {
+    kbAgentByUaid: async (args: any, ctx: any, info: any) => {
       const graphdbCtx = (ctx && typeof ctx === 'object' ? (ctx as any).graphdb : null) as GraphdbQueryContext | null;
       const uaid = canonicalizeUaid(assertUaidInput(args?.uaid, 'uaid'));
       if (!uaid) return null;
@@ -1297,14 +1297,14 @@ LIMIT 1
         }
       }
 
-      // If caller passed uaid:did:8004:* (common for "find HOL json for a DID"),
+      // If caller passed uaid:did:8004:* and we did NOT find an on-chain KB row,
       // translate it via HOL registry search on meta.nativeId and then return the matching HOL agent (uaid:aid:*).
       //
-      // IMPORTANT: we do this even when we *did* find an on-chain 8004 agent row, because callers want the HOL JSON
-      // attached under identityHol/descriptor for that did:8004 nativeId.
+      // PERF: do NOT call out to HOL registry when the on-chain agent already exists.
+      // That extra HTTP roundtrip dominated `kbAgentByUaid` latency in production and usually returns no hits.
       if (uaid.startsWith('uaid:did:8004:')) {
         const nativeId = extractHolNativeIdFromUaid(uaid);
-        if (nativeId) {
+        if (nativeId && !res.rows.length) {
           // eslint-disable-next-line no-console
           console.info('[hol][registry-nativeId-search] ensure (from did uaid)', { uaid, nativeId, hadKbRow: res.rows.length > 0 });
           let holUaid: string | null = null;
@@ -1328,7 +1328,7 @@ LIMIT 1
           }
           // eslint-disable-next-line no-console
           console.info('[kb][kbAgentByUaid] after ensureHolHitInKnowledgeGraph', { uaid, nativeId, holUaid, rows: res.rows.length });
-        } else {
+        } else if (!nativeId) {
           // eslint-disable-next-line no-console
           console.info('[hol][registry-nativeId-search] skipped (no nativeId extracted)', { uaid });
         }

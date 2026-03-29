@@ -6,6 +6,7 @@ import {
   updateGraphdb,
   uploadTurtleToRepository,
 } from '../graphdb-http.js';
+import { createHash } from 'node:crypto';
 import { escapeTurtleString, iriEncodeSegment } from '../rdf/common.js';
 import { DEFAULT_TRUST_LEDGER_BADGES, type TrustLedgerBadgeDefinition } from './badges.js';
 
@@ -51,6 +52,23 @@ function trustLedgerScoreIri(chainId: number, agentId: string): string {
 
 function trustLedgerBadgeAwardIri(chainId: number, agentId: string, badgeId: string): string {
   return `<https://www.agentictrust.io/id/trust-ledger-badge-award/${chainId}/${iriEncodeSegment(agentId)}/${iriEncodeSegment(badgeId)}>`;
+}
+
+function agentKeyFromAgentIri(agentIri: string): string {
+  const s = String(agentIri ?? '').trim();
+  // Deterministic, compact key. 128-bit (32 hex chars) is plenty; avoid very long hashes.
+  const hex = createHash('sha256').update(s).digest('hex').slice(0, 32);
+  return `agent:${hex}`;
+}
+
+function trustLedgerScoreIriForAgent(chainId: number, agentIri: string): string {
+  const key = agentKeyFromAgentIri(agentIri);
+  return `<https://www.agentictrust.io/id/agent-trust-ledger-score/${chainId}/${iriEncodeSegment(key)}>`;
+}
+
+function trustLedgerBadgeAwardIriForAgent(chainId: number, agentIri: string, badgeId: string): string {
+  const key = agentKeyFromAgentIri(agentIri);
+  return `<https://www.agentictrust.io/id/trust-ledger-badge-award/${chainId}/${iriEncodeSegment(key)}/${iriEncodeSegment(badgeId)}>`;
 }
 
 function jsonLiteral(s: string): string {
@@ -203,26 +221,21 @@ function badgeDefsTurtle(defs: TrustLedgerBadgeDefinition[], now: number): strin
 
 function signalsPageSparql(args: { chainId: number; ctx: string; limit: number; offset: number }): string {
   const { ctx, limit, offset } = args;
-  // IMPORTANT: derive agentId from the agent IRI (not from core:hasIdentity joins).
-  // We have observed cases where an ERC-8004 identity node (agentId) is linked to multiple agents,
-  // which would cross-contaminate this trust-ledger computation because it mints deterministic IRIs
-  // by (chainId, agentId).
-  const agentPrefix = `https://www.agentictrust.io/id/agent/${Math.trunc(args.chainId)}/`;
   return [
     'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>',
     'PREFIX core: <https://agentictrust.io/ontology/core#>',
+    'PREFIX erc8004: <https://agentictrust.io/ontology/erc8004#>',
     '',
     'SELECT ?agent ?agentId ?validationCount ?feedbackCount WHERE {',
     '  {',
     '    SELECT ?agent ?agentId WHERE {',
     `      GRAPH <${ctx}> {`,
           '        ?agent a core:AIAgent .',
-          `        FILTER(STRSTARTS(STR(?agent), "${agentPrefix}"))`,
-          `        BIND(STRAFTER(STR(?agent), "${agentPrefix}") AS ?agentId)`,
-          '        FILTER(REGEX(?agentId, "^[0-9]+$"))',
+          '        OPTIONAL { ?agent erc8004:agentId8004 ?_agentId8004 . }',
+          '        BIND(IF(BOUND(?_agentId8004), STR(?_agentId8004), "") AS ?agentId)',
     '      }',
     '    }',
-    '    ORDER BY xsd:integer(?agentId) ASC(STR(?agent))',
+      '    ORDER BY ASC(STR(?agent))',
     `    LIMIT ${Math.trunc(limit)}`,
     `    OFFSET ${Math.trunc(offset)}`,
     '  }',
@@ -241,17 +254,18 @@ function signalsForAgentIdsSparql(args: { ctx: string; chainId: number; agentIds
   const ids = Array.from(new Set((args.agentIds || []).map((n) => Math.trunc(Number(n))).filter((n) => Number.isFinite(n) && n >= 0)));
   if (!ids.length) return 'SELECT ?agent WHERE { FILTER(false) }';
   const chainId = Number.isFinite(Number(args.chainId)) ? Math.trunc(Number(args.chainId)) : 0;
-  const agentPrefix = `https://www.agentictrust.io/id/agent/${chainId}/`;
-  const agentIris = ids.map((n) => `<${agentPrefix}${n}>`).join(' ');
+  const agentIdValues = ids.map((n) => `"${n}"`).join(' ');
   return [
     'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>',
     'PREFIX core: <https://agentictrust.io/ontology/core#>',
+    'PREFIX erc8004: <https://agentictrust.io/ontology/erc8004#>',
     '',
     'SELECT ?agent ?agentId ?validationCount ?feedbackCount WHERE {',
     `  GRAPH <${ctx}> {`,
-    `    VALUES ?agent { ${agentIris} }`,
     '    ?agent a core:AIAgent .',
-    `    BIND(STRAFTER(STR(?agent), "${agentPrefix}") AS ?agentId)`,
+    `    VALUES ?agentId { ${agentIdValues} }`,
+    '    ?agent erc8004:agentId8004 ?_agentId8004 .',
+    '    FILTER(STR(?_agentId8004) = ?agentId)',
     '    OPTIONAL { ?agent core:hasValidationAssertionSummary ?vs . ?vs core:validationAssertionCount ?validationCount . }',
     '    OPTIONAL { ?agent core:hasFeedbackAssertionSummary ?fs . ?fs core:feedbackAssertionCount ?feedbackCount . }',
     '  }',
@@ -844,10 +858,11 @@ WHERE {
       for (const b of bindings) {
         const agentIri = asStrBinding(b?.agent);
         const agentId = asStrBinding(b?.agentId);
-        if (!agentIri || !agentId) continue;
+      if (!agentIri) continue;
+      const agentIdStr = agentId ?? '';
         if (seen.has(agentIri)) continue;
         seen.add(agentIri);
-        uniqueAgents.push({ agentIri, agentId });
+      uniqueAgents.push({ agentIri, agentId: agentIdStr });
       }
     }
 
@@ -883,7 +898,7 @@ WHERE {
       for (const def of awarded) {
         const badgeId = String(def.badgeId ?? '').trim();
         if (!badgeId) continue;
-        const awardIri = trustLedgerBadgeAwardIri(cId, agentId, badgeId);
+        const awardIri = trustLedgerBadgeAwardIriForAgent(cId, agentIri, badgeId);
         const defIri = trustLedgerBadgeDefIri(badgeId);
         const evidence = JSON.stringify({ signals: sig, ruleId: def.ruleId, ruleConfig: def.ruleConfig ?? null });
 
@@ -902,13 +917,15 @@ WHERE {
       }
 
       // Rollup score record
-      const scoreIri = trustLedgerScoreIri(cId, agentId);
+      const scoreIri = trustLedgerScoreIriForAgent(cId, agentIri);
       const digestJson = JSON.stringify({ badgeIds: awarded.map((d) => d.badgeId), signals: sig });
 
       lines.push(`${scoreIri} a analytics:AgentTrustLedgerScore, prov:Entity ;`);
       lines.push(`  analytics:trustLedgerForAgent <${agentIri}> ;`);
       lines.push(`  analytics:trustLedgerChainId ${cId} ;`);
-      lines.push(`  analytics:trustLedgerAgentId ${jsonLiteral(agentId)} ;`);
+      if (agentId && agentId.trim()) {
+        lines.push(`  analytics:trustLedgerAgentId ${jsonLiteral(agentId)} ;`);
+      }
       lines.push(`  analytics:totalPoints ${Math.max(0, Math.trunc(totalPoints))} ;`);
       lines.push(`  analytics:badgeCount ${Math.max(0, Math.trunc(awarded.length))} ;`);
       lines.push(`  analytics:trustLedgerComputedAt ${now} ;`);

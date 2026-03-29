@@ -95,7 +95,6 @@ export async function materializeBestRankIndexForChain(
   ].join('\n');
   await updateGraphdb(baseUrl, repository, auth, del);
 
-  const agentPrefix = `https://www.agentictrust.io/id/agent/${cId}/`;
   let agentCount = 0;
   const seenAgents = new Set<string>();
 
@@ -128,19 +127,19 @@ export async function materializeBestRankIndexForChain(
       'SELECT ?agent ?p ?a ?t ?s WHERE {',
       `  GRAPH <${ctxIri}> {`,
       '    ?agent a core:AIAgent .',
-      `    FILTER(STRSTARTS(STR(?agent), "${agentPrefix}"))`,
-      `    BIND(STRAFTER(STR(?agent), "${agentPrefix}") AS ?agentId)`,
-      '    FILTER(REGEX(?agentId, "^[0-9]+$"))',
       '    OPTIONAL { ?agent core:createdAtTime ?createdAtTime }',
       '  }',
       `  GRAPH <${analyticsCtxIri}> {`,
-      `    BIND(IRI(CONCAT("https://www.agentictrust.io/id/agent-trust-ledger-score/${cId}/", ?agentId)) AS ?tls)`,
-      '    OPTIONAL { ?tls analytics:totalPoints ?points }',
-      `    BIND(IRI(CONCAT("https://www.agentictrust.io/id/agent-trust-index/${cId}/", ?agentId)) AS ?atiIri)`,
-      '    OPTIONAL { ?atiIri analytics:overallScore ?ati }',
+      '    OPTIONAL {',
+      '      ?agent analytics:hasTrustLedgerScore ?tls .',
+      '      OPTIONAL { ?tls analytics:totalPoints ?points }',
+      '    }',
+      '    OPTIONAL {',
+      '      ?ati analytics:forAgent ?agent ; analytics:overallScore ?atiScore .',
+      '    }',
       '  }',
       '  BIND(COALESCE(xsd:integer(?points), 0) AS ?p)',
-      '  BIND(COALESCE(xsd:integer(?ati), 0) AS ?a)',
+      '  BIND(COALESCE(xsd:integer(?atiScore), 0) AS ?a)',
       '  BIND(COALESCE(xsd:integer(?createdAtTime), 0) AS ?t)',
       '  BIND(STR(?agent) AS ?s)',
       seekFilter ? seekFilter : '',

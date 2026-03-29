@@ -145,7 +145,7 @@ async function syncAgentUriUpdates(
     'agentURIUpdates',
     {
       optional: true,
-      first: 500,
+      first: 1000,
       maxItems: maxUpdatesPerRun,
       startAfterBlockNumber,
       startAfterId,
@@ -384,7 +384,7 @@ async function syncAgents(endpoint: { url: string; chainId: number; name: string
         'agentMetadata_collection',
         {
           optional: true,
-          first: 500,
+          first: 1000,
           maxItems: 250_000,
         },
       );
@@ -524,14 +524,14 @@ export async function syncSingleAgent(
   }
   // Attach on-chain agent metadata KV rows (required for agentAccount/UAID canonicalization and SmartAgent linking).
   // Avoid schema-dependent `where: { id_starts_with: ... }` (not supported on some subgraphs) and skip<=5000 limits.
-  let metas = await fetchAgentMetadataCollectionForAgentId(endpoint.url, id, { optional: true, first: 500, maxItems: 5000 }).catch(
+  let metas = await fetchAgentMetadataCollectionForAgentId(endpoint.url, id, { optional: true, first: 1000, maxItems: 5000 }).catch(
     () => [],
   );
   // Last-resort fallback (bounded): small skip-based scan + client-side filter.
   if (!Array.isArray(metas) || metas.length === 0) {
     const all = await fetchAllFromSubgraph(endpoint.url, AGENT_METADATA_COLLECTION_QUERY, 'agentMetadata_collection', {
       optional: true,
-      first: 500,
+      first: 1000,
       maxSkip: 5000,
     }).catch(() => []);
     metas = Array.isArray(all) ? all.filter((m: any) => String(m?.id ?? '').trim().startsWith(`${id}-`)) : [];
@@ -1089,8 +1089,8 @@ export type BulkSubgraphData = {
 
 /** Bulk-load feedbacks, validation requests/responses, and associations once per run for pipeline. */
 async function loadBulkSubgraphData(endpoint: { url: string; chainId: number; name: string }): Promise<BulkSubgraphData> {
-  const opts = { optional: true, first: 500, maxSkip: 150_000 };
-  const bulkDelayMs = Math.max(0, Number(process.env.SUBGRAPH_BULK_FETCH_DELAY_MS) || 2000);
+  const opts = { optional: true, first: 1000, maxSkip: 150_000 };
+  const bulkDelayMs = 750;
   const feedbackItems = await fetchAllFromSubgraph(endpoint.url, FEEDBACKS_QUERY, 'repFeedbacks', opts).catch(() => []);
   if (bulkDelayMs) await sleep(bulkDelayMs);
   const reqItems = await fetchAllFromSubgraph(endpoint.url, VALIDATION_REQUESTS_QUERY, 'validationRequests', opts).catch(() => []);
@@ -1489,6 +1489,10 @@ async function runSync(command: SyncCommand, resetContext: boolean = false) {
     const agentIdsArg = process.argv.find((a) => a.startsWith('--agent-ids='));
     const limitArg = process.argv.find((a) => a.startsWith('--limit='));
     const ensureAgentArg = process.argv.includes('--ensure-agent');
+    const trustLedgerAll =
+      process.argv.includes('--trust-ledger-all') ||
+      process.env.SYNC_TRUST_LEDGER_ALL === '1' ||
+      process.env.SYNC_TRUST_LEDGER_ALL === 'true';
     let agentIds: string[];
     let ingestedAgentCount = 0;
     if (agentIdsArg) {
@@ -1520,6 +1524,20 @@ async function runSync(command: SyncCommand, resetContext: boolean = false) {
       if (!ingestedIds.length && !updatedIds.length) {
         console.info('[sync] [agent-pipeline] no new agents and no agentURIUpdates. Running ENS sync anyway.');
 
+        // Optional: full-chain trust-ledger recompute (useful after reset-chain-agents or when backfilling analytics).
+        if (trustLedgerAll) {
+          await syncTrustLedgerToGraphdbForChain(chainId, { resetContext: true }).catch((e: any) => {
+            console.warn('[sync] [agent-pipeline] trust-ledger-all failed (non-fatal)', { chainId, error: String(e?.message || e || '') });
+          });
+          if (chainId !== 295) {
+            const maxRanksRaw = Number(process.env.SYNC_BEST_RANK_MAX);
+            const maxRanks = Number.isFinite(maxRanksRaw) && maxRanksRaw > 0 ? Math.trunc(maxRanksRaw) : 10_000;
+            await materializeBestRankIndexForChain(chainId, { force: true, minAgeSeconds: 0, maxRanks }).catch((e: any) => {
+              console.warn('[sync] [agent-pipeline] best-rank index failed (non-fatal)', { chainId, error: String(e?.message || e || '') });
+            });
+          }
+        }
+
         // ENS parent sync: materialize subdomains (e.g. *.8004-agent.eth) into this chain's KB context.
         // ENS source chain: mainnet for mainnet, sepolia for eth/base/op sepolia, Linea/Linea Sepolia for their chains.
         const ensSourceChainId = chainId === 1 ? 1 : chainId === 59144 || chainId === 59141 ? chainId : 11155111;
@@ -1535,19 +1553,20 @@ async function runSync(command: SyncCommand, resetContext: boolean = false) {
         ingestedAgentCount: ingestedIds.length,
         updatedAgentCount: updatedIds.length,
       });
-      const cooldownMs = Math.max(0, Number(process.env.SUBGRAPH_COOLDOWN_AFTER_AGENTS_MS) || 3000);
+      const cooldownMs = 2000;
       if (cooldownMs) {
         console.info('[sync] [agent-pipeline] cooldown before bulk load', { cooldownMs });
         await sleep(cooldownMs);
       }
     }
-    // Bulk-loading is useful primarily when we've ingested a new batch of agents.
-    // If we only have agentURIUpdates (no new mints), avoid doing expensive chain-wide bulk fetch.
-    const shouldBulkLoad = !agentIdsArg && ingestedAgentCount > 0;
+    // For large runs (including `--agent-ids=...`), avoid falling back to per-agent subgraph calls.
+    // Bulk-loading is chain-wide, but it is still dramatically fewer requests than N-per-agent fetches.
+    // For small batches, we can skip bulk and do targeted per-agent fetches.
+    const shouldBulkLoad = agentIds.length >= 250;
     const bulk: BulkSubgraphData | undefined = shouldBulkLoad
       ? await loadBulkSubgraphData(endpoint).catch(() => undefined)
       : undefined;
-    const useBatch = bulk != null;
+    const useBatch = !agentIdsArg && !ensureAgentArg && agentIds.length >= 25;
     const agentIriByDidIdentity =
       useBatch ? await listAgentIriByDidIdentity(chainId).catch(() => new Map<string, string>()) : undefined;
     const timing =
@@ -1578,21 +1597,29 @@ async function runSync(command: SyncCommand, resetContext: boolean = false) {
       const tAcct = fullTiming ? Date.now() : 0;
       await syncAgentCardsForAgentIds(chainId, agentIds, {});
       const tCards = fullTiming ? Date.now() : 0;
-      await syncFeedbacksForBatch(endpoint, agentIds, bulk!, agentIriByDidIdentity!);
+      if (bulk) await syncFeedbacksForBatch(endpoint, agentIds, bulk, agentIriByDidIdentity!);
+      else console.warn('[sync] [agent-pipeline] skipping feedbacks/validations/associations (no bulk preload)');
       const tFb = fullTiming ? Date.now() : 0;
-      if (!skipValidations) await syncValidationsForBatch(endpoint, agentIds, bulk!, agentIriByDidIdentity!);
+      if (bulk && !skipValidations) await syncValidationsForBatch(endpoint, agentIds, bulk, agentIriByDidIdentity!);
       const tVal = fullTiming ? Date.now() : 0;
-      if (!skipAssociations) await syncAssociationsForBatch(endpoint, agentIds, bulk!, accountIrisByAgentId);
+      if (bulk && !skipAssociations) await syncAssociationsForBatch(endpoint, agentIds, bulk, accountIrisByAgentId);
       const tAssoc = fullTiming ? Date.now() : 0;
       await materializeAssertionSummariesForChain(chainId, { agentIds });
       const tSum = fullTiming ? Date.now() : 0;
       await runTrustIndexForChains({ chainIdsCsv: String(chainId), resetContext: false, agentIds });
       const tTrustIndex = fullTiming ? Date.now() : 0;
       await syncTrustLedgerToGraphdbForChain(chainId, { agentIds });
-      if (process.env.SYNC_MATERIALIZE_BEST_RANK === '1' || process.env.SYNC_MATERIALIZE_BEST_RANK === 'true') {
+      if (trustLedgerAll) {
+        await syncTrustLedgerToGraphdbForChain(chainId, { resetContext: true }).catch((e: any) => {
+          console.warn('[sync] [agent-pipeline] trust-ledger-all failed (non-fatal)', { chainId, error: String(e?.message || e || '') });
+        });
+      }
+      // Always-on: keep best-rank index fresh for fast kbAgents(orderBy: bestRank) queries.
+      // This job is internally TTL-gated (minAgeSeconds) so repeated pipeline runs don't constantly recompute.
+      if (chainId !== 295) {
         const maxRanksRaw = Number(process.env.SYNC_BEST_RANK_MAX);
         const maxRanks = Number.isFinite(maxRanksRaw) && maxRanksRaw > 0 ? Math.trunc(maxRanksRaw) : 10_000;
-        await materializeBestRankIndexForChain(chainId, { force: false, minAgeSeconds: 60 * 60, maxRanks }).catch((e: any) => {
+        await materializeBestRankIndexForChain(chainId, { force: trustLedgerAll, minAgeSeconds: trustLedgerAll ? 0 : 60 * 60, maxRanks }).catch((e: any) => {
           console.warn('[sync] [agent-pipeline] best-rank index failed (non-fatal)', { chainId, error: String(e?.message || e || '') });
         });
       }
@@ -1659,10 +1686,16 @@ async function runSync(command: SyncCommand, resetContext: boolean = false) {
       }
     }
       await syncTrustLedgerToGraphdbForChain(chainId, { agentIds });
-      if (process.env.SYNC_MATERIALIZE_BEST_RANK === '1' || process.env.SYNC_MATERIALIZE_BEST_RANK === 'true') {
+      if (trustLedgerAll) {
+        await syncTrustLedgerToGraphdbForChain(chainId, { resetContext: true }).catch((e: any) => {
+          console.warn('[sync] [agent-pipeline] trust-ledger-all failed (non-fatal)', { chainId, error: String(e?.message || e || '') });
+        });
+      }
+      // Always-on: keep best-rank index fresh for fast kbAgents(orderBy: bestRank) queries.
+      if (chainId !== 295) {
         const maxRanksRaw = Number(process.env.SYNC_BEST_RANK_MAX);
         const maxRanks = Number.isFinite(maxRanksRaw) && maxRanksRaw > 0 ? Math.trunc(maxRanksRaw) : 10_000;
-        await materializeBestRankIndexForChain(chainId, { force: false, minAgeSeconds: 60 * 60, maxRanks }).catch((e: any) => {
+        await materializeBestRankIndexForChain(chainId, { force: trustLedgerAll, minAgeSeconds: trustLedgerAll ? 0 : 60 * 60, maxRanks }).catch((e: any) => {
           console.warn('[sync] [agent-pipeline] best-rank index failed (non-fatal)', { chainId, error: String(e?.message || e || '') });
         });
       }

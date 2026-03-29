@@ -540,7 +540,7 @@ export async function syncEnsParentForChain(
     'domains',
     {
       optional: false,
-      first: 500,
+      first: 1000,
       maxSkip: 200_000,
       buildVariables: ({ first, skip }) => ({ first, skip, suffix }),
     },

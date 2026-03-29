@@ -64,6 +64,9 @@ export const graphQLSchemaStringKb = `
   input KbAgentWhereInput {
     chainId: Int
     agentIdentifierMatch: String
+    # Filter agents by the EOA that owns their agentAccount (core:hasAgentAccount).
+    # Matches when agentAccount is the EOA directly OR when agentAccount is a SmartAccount with eth:hasEOAOwner == EOA.
+    agentAccountOwnerAddress: String
     did8004: String
     uaid: String
     uaid_in: [String!]

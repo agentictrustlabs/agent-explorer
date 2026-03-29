@@ -1253,6 +1253,10 @@ opts?: {
     typeof where.agentIdentifierMatch === 'string' && where.agentIdentifierMatch.trim()
       ? where.agentIdentifierMatch.trim()
       : null;
+  const agentAccountOwnerAddress: string | null =
+    typeof (where as any).agentAccountOwnerAddress === 'string' && String((where as any).agentAccountOwnerAddress).trim()
+      ? String((where as any).agentAccountOwnerAddress).trim().toLowerCase()
+      : null;
 
   const agentNameContains =
     typeof where.agentName_contains === 'string' && where.agentName_contains.trim() ? where.agentName_contains.trim() : null;
@@ -1332,6 +1336,21 @@ opts?: {
         ` || EXISTS { ?agent core:hasIdentity ?_idEnsm . ?_idEnsm a ens:AgentIdentityEns ; core:hasIdentifier ?_identEnsm . ?_identEnsm core:protocolIdentifier ?_didEnsm . FILTER(STRENDS(STR(?_didEnsm), ":${escaped}")) }` +
         ` || EXISTS { ?agent core:uaid ?_uaidm . FILTER(STRENDS(STR(?_uaidm), ":${escaped}")) }` +
         `)`,
+    );
+  }
+  // agentAccountOwnerAddress:
+  // - matches if the agent's core:hasAgentAccount is the EOA itself, OR
+  // - core:hasAgentAccount is a SmartAccount whose eth:hasEOAOwner is the EOA.
+  if (agentAccountOwnerAddress) {
+    const escaped = agentAccountOwnerAddress.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    // Use pure graph patterns (UNION) to avoid boolean EXISTS expressions inside a graph pattern.
+    // This is more compatible with GraphDB's parser and planner.
+    filters.push(
+      `EXISTS {` +
+        ` ?agent core:hasAgentAccount ?_agentAccount .` +
+        ` { ?_agentAccount eth:accountAddress "${escaped}" }` +
+        ` UNION { ?_agentAccount eth:hasEOAOwner ?_eoa . ?_eoa eth:accountAddress "${escaped}" }` +
+      ` }`,
     );
   }
   if (uaidFilter) {
@@ -1428,30 +1447,25 @@ opts?: {
   }
 
   if (needsAnalytics && analyticsCtxIri) {
-    // PERF: Avoid join fanout against analytics graphs.
+    // CONSISTENCY: analytics must work for *all* agents (numeric IRIs and account-anchored IRIs).
+    // Do not parse IDs out of agent IRIs or require ERC-8004 identity fields to be present.
     //
-    // The old pattern joined from ?agent -> analytics:hasTrustLedgerScore ?tls and from ?ati by agentId,
-    // which can explode bindings if there are duplicate score/index nodes (or duplicate properties)
-    // and forces GraphDB to sort a large intermediate result for ORDER BY/LIMIT.
-    //
-    // Instead, derive deterministic analytics IRIs from the agent IRI:
-    // - trust-ledger score:  https://www.agentictrust.io/id/agent-trust-ledger-score/<chainId>/<agentId>
-    // - trust-index (ATI):   https://www.agentictrust.io/id/agent-trust-index/<chainId>/<agentId>
-    //
-    // This turns analytics lookups into simple subject-property reads and keeps the page query stable.
-    const agentPrefix = `https://www.agentictrust.io/id/agent/${chainId}/`;
-    pageOptional.push(`    BIND(STRAFTER(STR(?agent), "${agentPrefix}") AS ?_agentIdStr)`);
+    // Trust-ledger score is linked by `analytics:hasTrustLedgerScore` (and the score points back via `analytics:trustLedgerForAgent`).
+    // ATI is linked by `analytics:forAgent`.
     pageOptional.push('    OPTIONAL {');
     pageOptional.push(`      GRAPH <${analyticsCtxIri}> {`);
-    pageOptional.push(`        BIND(IRI(CONCAT("https://www.agentictrust.io/id/agent-trust-ledger-score/${chainId}/", ?_agentIdStr)) AS ?_tlsIri)`);
-    pageOptional.push('        OPTIONAL { ?_tlsIri analytics:totalPoints ?trustLedgerTotalPoints . }');
-    pageOptional.push('        OPTIONAL { ?_tlsIri analytics:badgeCount ?trustLedgerBadgeCount . }');
-    pageOptional.push('        OPTIONAL { ?_tlsIri analytics:trustLedgerComputedAt ?trustLedgerComputedAt . }');
-    pageOptional.push(`        BIND(IRI(CONCAT("https://www.agentictrust.io/id/agent-trust-index/${chainId}/", ?_agentIdStr)) AS ?_atiIri)`);
-    pageOptional.push('        OPTIONAL { ?_atiIri analytics:overallScore ?atiOverallScore . }');
-    pageOptional.push('        OPTIONAL { ?_atiIri analytics:overallConfidence ?atiOverallConfidence . }');
-    pageOptional.push('        OPTIONAL { ?_atiIri analytics:computedAt ?atiComputedAt . }');
-    pageOptional.push('        OPTIONAL { ?_atiIri analytics:version ?atiVersion . }');
+    pageOptional.push('        OPTIONAL {');
+    pageOptional.push('          ?agent analytics:hasTrustLedgerScore ?tls .');
+    pageOptional.push('          OPTIONAL { ?tls analytics:totalPoints ?trustLedgerTotalPoints . }');
+    pageOptional.push('          OPTIONAL { ?tls analytics:badgeCount ?trustLedgerBadgeCount . }');
+    pageOptional.push('          OPTIONAL { ?tls analytics:trustLedgerComputedAt ?trustLedgerComputedAt . }');
+    pageOptional.push('        }');
+    pageOptional.push('        OPTIONAL {');
+    pageOptional.push('          ?ati analytics:forAgent ?agent ; analytics:overallScore ?atiOverallScore .');
+    pageOptional.push('          OPTIONAL { ?ati analytics:overallConfidence ?atiOverallConfidence . }');
+    pageOptional.push('          OPTIONAL { ?ati analytics:computedAt ?atiComputedAt . }');
+    pageOptional.push('          OPTIONAL { ?ati analytics:version ?atiVersion . }');
+    pageOptional.push('        }');
     pageOptional.push('      }');
     pageOptional.push('    }');
   }
@@ -1514,6 +1528,7 @@ opts?: {
         return [
           'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>',
           'PREFIX core: <https://agentictrust.io/ontology/core#>',
+          ...(agentAccountOwnerAddress ? ['PREFIX eth: <https://agentictrust.io/ontology/eth#>'] : []),
           'PREFIX erc8004: <https://agentictrust.io/ontology/erc8004#>',
           'PREFIX dcterms: <http://purl.org/dc/terms/>',
           ...(needsAnalytics ? ['PREFIX analytics: <https://agentictrust.io/ontology/core/analytics#>'] : []),
@@ -1545,7 +1560,6 @@ opts?: {
         if (skip >= bestRankMax) {
           // fall through to the analytics-driven top-K query (slower, but complete).
         } else {
-        const agentPrefix = `https://www.agentictrust.io/id/agent/${chainId}/`;
         return [
           'PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>',
           'PREFIX core: <https://agentictrust.io/ontology/core#>',
@@ -1556,7 +1570,6 @@ opts?: {
           '    SELECT ?agent (MIN(xsd:integer(?_r)) AS ?bestRank) WHERE {',
           `      GRAPH <${analyticsCtxIri}> {`,
           '        ?agent analytics:bestRank ?_r .',
-          `        FILTER(STRSTARTS(STR(?agent), "${agentPrefix}"))`,
           '      }',
           `      GRAPH <${ctxIri}> { ?agent a core:AIAgent . }`,
           '    }',
@@ -2099,6 +2112,7 @@ opts?: {
 
   const countSparql = [
     'PREFIX core: <https://agentictrust.io/ontology/core#>',
+    ...(agentAccountOwnerAddress ? ['PREFIX eth: <https://agentictrust.io/ontology/eth#>'] : []),
     ...(did8004Filter || agentIdentifierMatch ? ['PREFIX erc8004: <https://agentictrust.io/ontology/erc8004#>'] : []),
     ...(agentIdentifierMatch ? ['PREFIX ens: <https://agentictrust.io/ontology/ens#>'] : []),
     ...(agentNameContains ? ['PREFIX dcterms: <http://purl.org/dc/terms/>'] : []),
@@ -2493,10 +2507,8 @@ export async function kbAgentByUaidFastQuery(
           '        OPTIONAL { ?tls analytics:badgeCount ?trustLedgerBadgeCount . }',
           '        OPTIONAL { ?tls analytics:trustLedgerComputedAt ?trustLedgerComputedAt . }',
           '      }',
-          '      BIND(IF(BOUND(?agentId8004), STR(?agentId8004), "") AS ?_agentIdStr)',
           '      OPTIONAL {',
-          '        FILTER(?_agentIdStr != "")',
-          '        ?ati a analytics:AgentTrustIndex ; analytics:agentId ?_agentIdStr ; analytics:overallScore ?atiOverallScore .',
+          '        ?ati a analytics:AgentTrustIndex ; analytics:forAgent ?agent ; analytics:overallScore ?atiOverallScore .',
           '        OPTIONAL { ?ati analytics:overallConfidence ?atiOverallConfidence . }',
           '        OPTIONAL { ?ati analytics:version ?atiVersion . }',
           '        OPTIONAL { ?ati analytics:computedAt ?atiComputedAt . }',

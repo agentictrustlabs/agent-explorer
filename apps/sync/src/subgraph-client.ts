@@ -435,7 +435,7 @@ export async function fetchAllFromSubgraphByBlockNumberCursor(
     maxItems?: number;
   },
 ): Promise<any[]> {
-  const pageSize = opts?.first ?? 500;
+  const pageSize = opts?.first ?? 1000;
   const optional = opts?.optional ?? false;
   const maxRetries = opts?.maxRetries ?? 6;
   const maxItems = opts?.maxItems ?? 250_000;
@@ -602,7 +602,7 @@ export async function fetchAgentMetadataCollectionForAgentId(
   const id = String(agentId ?? '').trim();
   if (!id || !/^\d+$/.test(id)) return [];
 
-  const pageSize = opts?.first ?? 500;
+  const pageSize = opts?.first ?? 1000;
   const optional = opts?.optional ?? true;
   const maxRetries = opts?.maxRetries ?? (optional ? 6 : 3);
   const maxItems = opts?.maxItems ?? 5000;
@@ -692,7 +692,7 @@ export async function fetchAllFromSubgraphByIdCursor(
     maxItems?: number;
   },
 ): Promise<any[]> {
-  const pageSize = opts?.first ?? 500;
+  const pageSize = opts?.first ?? 1000;
   const optional = opts?.optional ?? false;
   const maxRetries = opts?.maxRetries ?? (optional ? 6 : 3);
   const maxItems = opts?.maxItems ?? 250_000;
@@ -792,7 +792,7 @@ export async function fetchAllFromSubgraphByMintedAtCursor(
     maxItems?: number;
   },
 ): Promise<any[]> {
-  const pageSize = opts?.first ?? 500;
+  const pageSize = opts?.first ?? 1000;
   const optional = opts?.optional ?? false;
   const maxRetries = opts?.maxRetries ?? 6;
   const maxItems = opts?.maxItems ?? 250_000;
@@ -1154,7 +1154,7 @@ export async function fetchAllFromSubgraph(
     buildVariables?: (args: { first: number; skip: number }) => Record<string, any>;
   },
 ): Promise<any[]> {
-  const pageSize = opts?.first ?? 500;
+  const pageSize = opts?.first ?? 1000;
   const maxSkip = opts?.maxSkip ?? 5000;
   const optional = opts?.optional ?? false;
   const maxRetries = opts?.maxRetries ?? (optional ? 6 : 3);
@@ -1314,7 +1314,7 @@ export async function fetchValidationRequestsByAgentId(
   if (!id) return [];
   return fetchAllFromSubgraph(graphqlUrl, VALIDATION_REQUESTS_QUERY_BY_AGENT, 'validationRequests', {
     optional: opts?.optional ?? true,
-    first: 500,
+    first: 1000,
     maxSkip: 50_000,
     buildVariables: ({ first, skip }) => ({ first, skip, agentId: id }),
   });
@@ -1330,7 +1330,7 @@ export async function fetchValidationResponsesByAgentId(
   if (!id) return [];
   return fetchAllFromSubgraph(graphqlUrl, VALIDATION_RESPONSES_QUERY_BY_AGENT, 'validationResponses', {
     optional: opts?.optional ?? true,
-    first: 500,
+    first: 1000,
     maxSkip: 50_000,
     buildVariables: ({ first, skip }) => ({ first, skip, agentId: id }),
   });
@@ -1346,7 +1346,7 @@ export async function fetchFeedbacksByAgentId(
   if (!id) return [];
   return fetchAllFromSubgraph(graphqlUrl, FEEDBACKS_QUERY_BY_AGENT, 'repFeedbacks', {
     optional: opts?.optional ?? true,
-    first: 500,
+    first: 1000,
     maxSkip: 50_000,
     buildVariables: ({ first, skip }) => ({ first, skip, agentId: id }),
   });

@@ -308,7 +308,7 @@ export default {
             kbOwnedAgents: (_p: any, args: any, ctx: any) => sharedKb.kbOwnedAgents(args, ctx),
             kbOwnedAgentsAllChains: (_p: any, args: any, ctx: any) => sharedKb.kbOwnedAgentsAllChains(args, ctx),
             kbIsOwner: (_p: any, args: any, ctx: any) => sharedKb.kbIsOwner(args, ctx),
-            kbAgentByUaid: (_p: any, args: any, ctx: any) => sharedKb.kbAgentByUaid(args, ctx),
+            kbAgentByUaid: (_p: any, args: any, ctx: any, info: any) => sharedKb.kbAgentByUaid(args, ctx, info),
             kbHolAgentProfileByUaid: (_p: any, args: any, ctx: any) => sharedKb.kbHolAgentProfileByUaid(args, ctx),
             kbHolCapabilities: (_p: any, args: any, ctx: any) => sharedKb.kbHolCapabilities(args, ctx),
             kbHolRegistries: (_p: any, args: any, ctx: any) => sharedKb.kbHolRegistries(args, ctx),
