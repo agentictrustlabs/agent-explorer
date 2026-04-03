@@ -31,6 +31,9 @@ const DEFAULT_LINEA_NAMING_REGISTRY_SEPOLIA = '0x257ed5b68c2a32273db8490e744028a
 // ENS mainnet subgraph ID (Graph Network / Explorer) used when ENS_MAINNET_GRAPHQL_URL is not set.
 // Requires GRAPHQL_API_KEY for gateway.thegraph.com.
 const ENS_MAINNET_SUBGRAPH_ID = '5XqPmWe6gjyrJtFn9cLy237i4cWw2j9HcUJEXsP5qGtH';
+// ENS sepolia subgraph ID (Graph Network / Explorer) used when ENS_SEPOLIA_GRAPHQL_URL is not set.
+// Requires GRAPHQL_API_KEY for gateway.thegraph.com.
+const ENS_SEPOLIA_SUBGRAPH_ID = 'DmMXLtMZnGbQXASJ7p1jfzLUbBYnYUD9zNBTxpkjHYXV';
 
 function getChainSuffix(chainId: number): string {
   if (chainId === 1) return 'MAINNET';
@@ -368,8 +371,12 @@ function getEnsSubgraphUrl(chainId: number): string {
     return '';
   }
   if (chainId === 11155111) {
-    // Hard-coded ENS Sepolia subgraph (The Graph Studio).
-    return ENS_SEPOLIA_GRAPHQL_URL || 'https://api.studio.thegraph.com/query/49574/enssepolia/version/latest/graphql';
+    // Prefer Graph Explorer (gateway) when GRAPHQL_API_KEY is available.
+    if (ENS_SEPOLIA_GRAPHQL_URL && ENS_SEPOLIA_GRAPHQL_URL.trim()) return ENS_SEPOLIA_GRAPHQL_URL.trim();
+    const key = String(GRAPHQL_API_KEY || '').trim();
+    if (key) return `https://gateway.thegraph.com/api/${key}/subgraphs/id/${ENS_SEPOLIA_SUBGRAPH_ID}`;
+    // Last-resort fallback (legacy hosted endpoint).
+    return 'https://api.studio.thegraph.com/query/49574/enssepolia/version/latest/graphql';
   }
   if (chainId === 59144) {
     // Linea naming subgraph (schema differs from canonical ENS; domains.name can be null).
