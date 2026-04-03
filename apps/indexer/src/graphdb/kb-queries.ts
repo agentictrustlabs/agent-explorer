@@ -310,15 +310,11 @@ async function hydrateIdentitiesForAgents(args: {
     '  ?registeredBy',
     '  ?registryNamespace',
     '  ?ownerAccount',
-    '  ?ownerAccountChainId',
-    '  ?ownerAccountAddress',
-    '  ?ownerAccountType',
-    '  ?ownerAccountDidEthr',
     '  ?agentAccount',
-    '  ?agentAccountChainId',
-    '  ?agentAccountAddress',
-    '  ?agentAccountType',
-    '  ?agentAccountDidEthr',
+    '  ?operatorAccount',
+    '  ?walletAccount',
+    '  ?ownerEOAAccount',
+    '  ?ownerEOAAccountFromOwner',
     'WHERE {',
     `  VALUES ?agent { ${valuesAgents} }`,
     `  GRAPH <${ctxIri}> {`,
@@ -373,7 +369,11 @@ async function hydrateIdentitiesForAgents(args: {
     '      OPTIONAL {',
     '        ?identity a erc8004:AgentIdentity8004 .',
     '        OPTIONAL { ?identity erc8004:hasOwnerAccount ?ownerAccount . }',
-    '        OPTIONAL { ?agent core:hasAgentAccount ?agentAccount . }',
+      '        OPTIONAL { ?identity erc8004:hasOperatorAccount ?operatorAccount . }',
+      '        OPTIONAL { ?identity erc8004:hasWalletAccount ?walletAccount . }',
+      '        OPTIONAL { ?identity erc8004:hasOwnerEOAAccount ?ownerEOAAccount . }',
+      '        OPTIONAL { ?agent core:hasAgentAccount ?agentAccount . }',
+      '        OPTIONAL { ?ownerAccount eth:hasEOAOwner ?ownerEOAAccountFromOwner . }',
     '      }',
     '',
     '      OPTIONAL {',
@@ -417,16 +417,10 @@ async function hydrateIdentitiesForAgents(args: {
   // agentIri -> identityIri -> hydrated identity (with skill/domain accumulation)
   const byAgent = new Map<string, Map<string, { ident: HydratedIdentity; skills: Set<string>; domains: Set<string> }>>();
 
-  const upsertAccount = (b: any, prefix: 'ownerAccount' | 'agentAccount'): any | null => {
-    const iri = asString(b?.[prefix]);
+  const accountFromIriVar = (b: any, varName: string): any | null => {
+    const iri = asString(b?.[varName]);
     if (!iri) return null;
-    return {
-      iri,
-      chainId: asNumber(b?.[`${prefix}ChainId`]),
-      address: asString(b?.[`${prefix}Address`]),
-      accountType: asString(b?.[`${prefix}Type`]),
-      didEthr: asString(b?.[`${prefix}DidEthr`]),
-    };
+    return { iri, chainId: null, address: null, accountType: null, didEthr: null };
   };
 
   for (const b of bindings) {
@@ -475,8 +469,12 @@ async function hydrateIdentitiesForAgents(args: {
         ident.did8004 = did;
         ident.agentId8004 = parsed?.agentId8004 ?? null;
         // isSmartAgent is derived from the agent's rdf:type (already in agentTypes), resolver can fill it.
-        ident.ownerAccount = upsertAccount(b as any, 'ownerAccount');
-        ident.agentAccount = upsertAccount(b as any, 'agentAccount');
+        ident.ownerAccount = accountFromIriVar(b as any, 'ownerAccount');
+        ident.agentAccount = accountFromIriVar(b as any, 'agentAccount');
+        ident.operatorAccount = accountFromIriVar(b as any, 'operatorAccount');
+        ident.walletAccount = accountFromIriVar(b as any, 'walletAccount');
+        ident.ownerEOAAccount =
+          accountFromIriVar(b as any, 'ownerEOAAccount') ?? accountFromIriVar(b as any, 'ownerEOAAccountFromOwner');
       } else if (kind === '8122') {
         ident.did8122 = asString((b as any)?.did8122) ?? did;
         ident.agentId8122 = asString((b as any)?.agentId8122);
@@ -484,8 +482,8 @@ async function hydrateIdentitiesForAgents(args: {
         ident.collectionName = asString((b as any)?.collectionName8122) ?? asString((b as any)?.registryName8122);
         ident.endpointType = asString((b as any)?.endpointType);
         ident.endpoint = asString((b as any)?.endpoint);
-        ident.ownerAccount = upsertAccount(b as any, 'ownerAccount');
-        ident.agentAccount = upsertAccount(b as any, 'agentAccount');
+        ident.ownerAccount = accountFromIriVar(b as any, 'ownerAccount');
+        ident.agentAccount = accountFromIriVar(b as any, 'agentAccount');
       } else if (kind === 'hol') {
         ident.uaidHOL = asString((b as any)?.uaidHOL);
       } else if (kind === 'ens') {
@@ -515,6 +513,89 @@ async function hydrateIdentitiesForAgents(args: {
     // stable-ish ordering: by kind then did
     identities.sort((a, b) => (a.kind || '').localeCompare(b.kind || '') || (a.did || '').localeCompare(b.did || ''));
     out.set(agent, identities);
+  }
+
+  // Fill in KbAccount details in a separate query to avoid GraphDB planner dropping identity rows.
+  try {
+    const accountIris: string[] = [];
+    for (const identities of out.values()) {
+      for (const i of identities) {
+        const push = (a: any | null | undefined) => {
+          const iri = typeof a?.iri === 'string' ? a.iri : null;
+          if (iri && iri.trim()) accountIris.push(iri.trim());
+        };
+        push((i as any).ownerAccount);
+        push((i as any).agentAccount);
+        push((i as any).operatorAccount);
+        push((i as any).walletAccount);
+        push((i as any).ownerEOAAccount);
+      }
+    }
+    const uniq = Array.from(new Set(accountIris));
+    if (uniq.length) {
+      const values = uniq.map((iri) => `<${iri}>`).join(' ');
+      const acctSparql = [
+        'PREFIX core: <https://agentictrust.io/ontology/core#>',
+        'PREFIX eth: <https://agentictrust.io/ontology/eth#>',
+        'SELECT',
+        '  ?acct',
+        '  (SAMPLE(?chainId) AS ?chainId)',
+        '  (SAMPLE(?address) AS ?address)',
+        '  (SAMPLE(?accountType) AS ?accountType)',
+        '  (SAMPLE(?didEthr) AS ?didEthr)',
+        'WHERE {',
+        `  VALUES ?acct { ${values} }`,
+        `  GRAPH <${ctxIri}> {`,
+        '    OPTIONAL { ?acct eth:accountChainId ?chainId . }',
+        '    OPTIONAL { ?acct eth:accountAddress ?address . }',
+        '    OPTIONAL { ?acct a eth:SmartAccount . BIND("SmartAccount" AS ?_tSmart) }',
+        '    OPTIONAL { ?acct a eth:EOAAccount . BIND("EOAAccount" AS ?_tEoa) }',
+        '    OPTIONAL { ?acct a eth:Account . BIND("Account" AS ?_tAcct) }',
+        '    BIND(COALESCE(?_tSmart, ?_tEoa, ?_tAcct, "") AS ?accountType)',
+        '    OPTIONAL {',
+        '      ?acct eth:hasAccountIdentifier ?id .',
+        '      ?id core:protocolIdentifier ?didEthr .',
+        '      FILTER(STRSTARTS(STR(?didEthr), "did:ethr:"))',
+        '    }',
+        '  }',
+        '}',
+        'GROUP BY ?acct',
+        '',
+      ].join('\n');
+      const acctBindings = await runGraphdbQuery(acctSparql, args.graphdbCtx, 'kbAgentsQuery.identities.accounts');
+      const byAcct = new Map<string, { chainId: number | null; address: string | null; accountType: string | null; didEthr: string | null }>();
+      for (const b of acctBindings) {
+        const iri = asString((b as any)?.acct);
+        if (!iri) continue;
+        byAcct.set(iri, {
+          chainId: asNumber((b as any)?.chainId),
+          address: asString((b as any)?.address),
+          accountType: asString((b as any)?.accountType) || null,
+          didEthr: asString((b as any)?.didEthr),
+        });
+      }
+      for (const identities of out.values()) {
+        for (const i of identities) {
+          const fill = (a: any | null | undefined) => {
+            const iri = typeof a?.iri === 'string' ? a.iri : null;
+            if (!iri || !iri.trim()) return;
+            const d = byAcct.get(iri);
+            if (!d) return;
+            a.chainId = d.chainId ?? null;
+            a.address = d.address ?? null;
+            a.accountType = d.accountType ?? null;
+            a.didEthr = d.didEthr ?? null;
+          };
+          fill((i as any).ownerAccount);
+          fill((i as any).agentAccount);
+          fill((i as any).operatorAccount);
+          fill((i as any).walletAccount);
+          fill((i as any).ownerEOAAccount);
+        }
+      }
+    }
+  } catch {
+    // non-fatal
   }
 
   return out;
@@ -572,15 +653,11 @@ async function hydrateIdentitiesForPairs(args: {
     '  ?registeredBy',
     '  ?registryNamespace',
     '  ?ownerAccount',
-    '  ?ownerAccountChainId',
-    '  ?ownerAccountAddress',
-    '  ?ownerAccountType',
-    '  ?ownerAccountDidEthr',
     '  ?agentAccount',
-    '  ?agentAccountChainId',
-    '  ?agentAccountAddress',
-    '  ?agentAccountType',
-    '  ?agentAccountDidEthr',
+    '  ?operatorAccount',
+    '  ?walletAccount',
+    '  ?ownerEOAAccount',
+    '  ?ownerEOAAccountFromOwner',
     'WHERE {',
     `  VALUES (?g ?agent) { ${valuesPairs} }`,
     '  GRAPH ?g {',
@@ -635,7 +712,11 @@ async function hydrateIdentitiesForPairs(args: {
     '    OPTIONAL {',
     '      ?identity a erc8004:AgentIdentity8004 .',
     '      OPTIONAL { ?identity erc8004:hasOwnerAccount ?ownerAccount . }',
+    '      OPTIONAL { ?identity erc8004:hasOperatorAccount ?operatorAccount . }',
+    '      OPTIONAL { ?identity erc8004:hasWalletAccount ?walletAccount . }',
+    '      OPTIONAL { ?identity erc8004:hasOwnerEOAAccount ?ownerEOAAccount . }',
     '      OPTIONAL { ?agent core:hasAgentAccount ?agentAccount . }',
+    '      OPTIONAL { ?ownerAccount eth:hasEOAOwner ?ownerEOAAccountFromOwner . }',
     '    }',
     '',
     '    OPTIONAL {',
@@ -680,16 +761,10 @@ async function hydrateIdentitiesForPairs(args: {
   // agentIri -> identityIri -> hydrated identity (with skill/domain accumulation)
   const byAgent = new Map<string, Map<string, { ident: HydratedIdentity; skills: Set<string>; domains: Set<string> }>>();
 
-  const upsertAccount = (b: any, prefix: 'ownerAccount' | 'agentAccount'): any | null => {
-    const iri = asString(b?.[prefix]);
+  const accountFromIriVar = (b: any, varName: string): any | null => {
+    const iri = asString(b?.[varName]);
     if (!iri) return null;
-    return {
-      iri,
-      chainId: asNumber(b?.[`${prefix}ChainId`]),
-      address: asString(b?.[`${prefix}Address`]),
-      accountType: asString(b?.[`${prefix}Type`]),
-      didEthr: asString(b?.[`${prefix}DidEthr`]),
-    };
+    return { iri, chainId: null, address: null, accountType: null, didEthr: null };
   };
 
   for (const b of bindings) {
@@ -736,8 +811,12 @@ async function hydrateIdentitiesForPairs(args: {
         const parsed = parseDid8004(did);
         ident.did8004 = did;
         ident.agentId8004 = parsed?.agentId8004 ?? null;
-        ident.ownerAccount = upsertAccount(b as any, 'ownerAccount');
-        ident.agentAccount = upsertAccount(b as any, 'agentAccount');
+        ident.ownerAccount = accountFromIriVar(b as any, 'ownerAccount');
+        ident.agentAccount = accountFromIriVar(b as any, 'agentAccount');
+        ident.operatorAccount = accountFromIriVar(b as any, 'operatorAccount');
+        ident.walletAccount = accountFromIriVar(b as any, 'walletAccount');
+        ident.ownerEOAAccount =
+          accountFromIriVar(b as any, 'ownerEOAAccount') ?? accountFromIriVar(b as any, 'ownerEOAAccountFromOwner');
       } else if (kind === '8122') {
         ident.did8122 = asString((b as any)?.did8122) ?? did;
         ident.agentId8122 = asString((b as any)?.agentId8122);
@@ -745,8 +824,8 @@ async function hydrateIdentitiesForPairs(args: {
         ident.collectionName = asString((b as any)?.collectionName8122) ?? asString((b as any)?.registryName8122);
         ident.endpointType = asString((b as any)?.endpointType);
         ident.endpoint = asString((b as any)?.endpoint);
-        ident.ownerAccount = upsertAccount(b as any, 'ownerAccount');
-        ident.agentAccount = upsertAccount(b as any, 'agentAccount');
+        ident.ownerAccount = accountFromIriVar(b as any, 'ownerAccount');
+        ident.agentAccount = accountFromIriVar(b as any, 'agentAccount');
       } else if (kind === 'hol') {
         ident.uaidHOL = asString((b as any)?.uaidHOL);
       } else if (kind === 'ens') {
@@ -775,6 +854,93 @@ async function hydrateIdentitiesForPairs(args: {
     }
     identities.sort((a, b) => (a.kind || '').localeCompare(b.kind || '') || (a.did || '').localeCompare(b.did || ''));
     out.set(agent, identities);
+  }
+
+  // Fill in KbAccount details in a separate query to avoid identity-row drops.
+  try {
+    const accountIris: string[] = [];
+    for (const identities of out.values()) {
+      for (const i of identities) {
+        const push = (a: any | null | undefined) => {
+          const iri = typeof a?.iri === 'string' ? a.iri : null;
+          if (iri && iri.trim()) accountIris.push(iri.trim());
+        };
+        push((i as any).ownerAccount);
+        push((i as any).agentAccount);
+        push((i as any).operatorAccount);
+        push((i as any).walletAccount);
+        push((i as any).ownerEOAAccount);
+      }
+    }
+    const uniq = Array.from(new Set(accountIris));
+    if (uniq.length) {
+      const values = uniq.map((iri) => `<${iri}>`).join(' ');
+      const acctSparql = [
+        'PREFIX core: <https://agentictrust.io/ontology/core#>',
+        'PREFIX eth: <https://agentictrust.io/ontology/eth#>',
+        'SELECT',
+        '  ?acct',
+        '  (SAMPLE(?chainId) AS ?chainId)',
+        '  (SAMPLE(?address) AS ?address)',
+        '  (SAMPLE(?accountType) AS ?accountType)',
+        '  (SAMPLE(?didEthr) AS ?didEthr)',
+        'WHERE {',
+        `  VALUES ?acct { ${values} }`,
+        '  GRAPH ?g {',
+        '    FILTER(STRSTARTS(STR(?g), "https://www.agentictrust.io/graph/data/subgraph/"))',
+        '    OPTIONAL { ?acct eth:accountChainId ?chainId . }',
+        '    OPTIONAL { ?acct eth:accountAddress ?address . }',
+        '    OPTIONAL { ?acct a eth:SmartAccount . BIND("SmartAccount" AS ?_tSmart) }',
+        '    OPTIONAL { ?acct a eth:EOAAccount . BIND("EOAAccount" AS ?_tEoa) }',
+        '    OPTIONAL { ?acct a eth:Account . BIND("Account" AS ?_tAcct) }',
+        '    BIND(COALESCE(?_tSmart, ?_tEoa, ?_tAcct, "") AS ?accountType)',
+        '    OPTIONAL {',
+        '      ?acct eth:hasAccountIdentifier ?id .',
+        '      ?id core:protocolIdentifier ?didEthr .',
+        '      FILTER(STRSTARTS(STR(?didEthr), "did:ethr:"))',
+        '    }',
+        '  }',
+        '}',
+        'GROUP BY ?acct',
+        '',
+      ].join('\\n');
+      const acctBindings = await runGraphdbQuery(acctSparql, args.graphdbCtx, 'kbAgentsQuery.identities.pairs.accounts');
+      const byAcct = new Map<
+        string,
+        { chainId: number | null; address: string | null; accountType: string | null; didEthr: string | null }
+      >();
+      for (const b of acctBindings) {
+        const iri = asString((b as any)?.acct);
+        if (!iri) continue;
+        byAcct.set(iri, {
+          chainId: asNumber((b as any)?.chainId),
+          address: asString((b as any)?.address),
+          accountType: asString((b as any)?.accountType) || null,
+          didEthr: asString((b as any)?.didEthr),
+        });
+      }
+      for (const identities of out.values()) {
+        for (const i of identities) {
+          const fill = (a: any | null | undefined) => {
+            const iri = typeof a?.iri === 'string' ? a.iri : null;
+            if (!iri || !iri.trim()) return;
+            const d = byAcct.get(iri);
+            if (!d) return;
+            a.chainId = d.chainId ?? null;
+            a.address = d.address ?? null;
+            a.accountType = d.accountType ?? null;
+            a.didEthr = d.didEthr ?? null;
+          };
+          fill((i as any).ownerAccount);
+          fill((i as any).agentAccount);
+          fill((i as any).operatorAccount);
+          fill((i as any).walletAccount);
+          fill((i as any).ownerEOAAccount);
+        }
+      }
+    }
+  } catch {
+    // non-fatal
   }
 
   return out;
